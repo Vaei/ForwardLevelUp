@@ -1,0 +1,234 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ForwardLevelUp</title>
+<meta name="description" content="Clean MSAA and proper ambient occlusion for Unreal Engine 5.8's mobile forward renderer.">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Barlow+Condensed:wght@600;700&family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap">
+<style>
+:root {
+  --bg: #f3f4f1; --surface: #ffffff; --fg: #1d211f; --muted: #5d655f; --line: #d5d9d3; --accent: #c2581f;
+  --display: "Barlow Condensed", "Arial Narrow", sans-serif;
+  --body: "IBM Plex Sans", "Segoe UI", system-ui, sans-serif;
+  --mono: "IBM Plex Mono", Consolas, monospace;
+}
+@media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) {
+  --bg: #171a18; --surface: #20241f; --fg: #e6e9e4; --muted: #9aa39b; --line: #343a35; --accent: #e7844a; color-scheme: dark } }
+:root[data-theme="dark"] { --bg: #171a18; --surface: #20241f; --fg: #e6e9e4; --muted: #9aa39b; --line: #343a35; --accent: #e7844a; color-scheme: dark }
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--fg); font: 16px/1.6 var(--body); }
+a { color: var(--accent); }
+.wrap { max-width: 1000px; margin: 0 auto; padding: 40px 16px 72px; display: grid; gap: 56px; }
+h1, h2, h3 { font-family: var(--display); margin: 0; line-height: 1.1; text-wrap: balance; }
+h1 { font-size: clamp(44px, 8vw, 72px); letter-spacing: .01em; }
+h2 { font-size: 28px; text-transform: uppercase; letter-spacing: .04em; }
+h3 { font-size: 21px; }
+p, li { max-width: 68ch; }
+p { margin: 0; }
+section { display: grid; gap: 16px; }
+code { font-family: var(--mono); font-size: .88em; background: var(--surface); border: 1px solid var(--line); border-radius: 3px; padding: 0 4px; overflow-wrap: anywhere; }
+pre { margin: 0; background: var(--surface); border: 1px solid var(--line); border-radius: 4px; padding: 12px 14px; overflow-x: auto; font: 13px/1.5 var(--mono); }
+pre code { border: 0; padding: 0; background: none; }
+.lede { font-size: 19px; max-width: 60ch; }
+.hero { display: grid; gap: 18px; }
+.actions { display: flex; flex-wrap: wrap; gap: 10px; }
+.btn { display: inline-block; font: 600 15px var(--body); padding: 9px 16px; border-radius: 4px; border: 1px solid var(--accent); text-decoration: none; }
+.btn.primary { background: var(--accent); color: #fff; }
+.fine { font-size: 14px; color: var(--muted); }
+.cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 12px; }
+.card { background: var(--surface); border: 1px solid var(--line); border-radius: 6px; padding: 16px; display: grid; gap: 6px; align-content: start; }
+.card p { font-size: 15px; color: var(--muted); }
+figure { margin: 0; display: grid; gap: 6px; min-width: 0; }
+figure img, figure video { width: 100%; height: auto; display: block; border: 1px solid var(--line); background: var(--surface); }
+figure img.zoom { image-rendering: pixelated; }
+figcaption { font: 13px var(--mono); color: var(--muted); }
+.controls { display: flex; flex-wrap: wrap; gap: 6px; }
+.controls button { font: 500 14px var(--body); color: var(--fg); background: var(--surface); border: 1px solid var(--line); border-radius: 4px; padding: 6px 11px; cursor: pointer; }
+.controls button[aria-pressed="true"] { border-color: var(--accent); color: var(--accent); }
+.controls button:disabled { opacity: .4; cursor: not-allowed; }
+.controls button:focus-visible, .btn:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.modenote { color: var(--muted); min-height: 1.6em; }
+.pair { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 12px; }
+.tablewrap { overflow-x: auto; }
+table { border-collapse: collapse; width: 100%; font-size: 15px; }
+th, td { text-align: left; padding: 8px 12px 8px 0; border-bottom: 1px solid var(--line); vertical-align: top; }
+th { font: 500 12px var(--mono); text-transform: uppercase; letter-spacing: .06em; color: var(--muted); }
+td.num { font-family: var(--mono); white-space: nowrap; }
+details { background: var(--surface); border: 1px solid var(--line); border-radius: 6px; padding: 12px 16px; }
+details summary { cursor: pointer; font-weight: 600; }
+details[open] summary { margin-bottom: 12px; }
+ol { padding-left: 22px; margin: 0; display: grid; gap: 10px; }
+footer { color: var(--muted); font-size: 14px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <header class="hero">
+    <h1>ForwardLevelUp</h1>
+    <p class="lede">Clean MSAA and proper ambient occlusion for Unreal Engine 5.8's mobile forward renderer, on PC and mobile hardware.</p>
+    <figure>
+      <img src="img/readme_hero.jpg" alt="No anti-aliasing on the left, ForwardLevelUp MSAA on the right" width="1450" height="445">
+    </figure>
+    <div class="actions">
+      <a class="btn primary" href="https://github.com/Vaei/ForwardLevelUp">Get it on GitHub</a>
+      <a class="btn" href="#compare">Compare</a>
+      <a class="btn" href="#start">Set it up</a>
+    </div>
+    <p class="fine">Engine patches for a UE 5.8 source build. Every feature is behind a console variable and does nothing until you turn it on.</p>
+  </header>
+
+  <section>
+    <h2>What you get</h2>
+    <div class="cards">
+      <div class="card"><h3>Smooth edges</h3><p>MSAA with a wider, smoother resolve. Thin railings, poles and wires stop shimmering.</p></div>
+      <div class="card"><h3>No halos</h3><p>Shadows and AO no longer bleed across MSAA edges.</p></div>
+      <div class="card"><h3>AO that works in forward</h3><p>Screen-space, distance-field and street-scale occlusion from buildings, all of it MSAA-aware.</p></div>
+      <div class="card"><h3>Contact shadows</h3><p>Characters darken the ground under them, using the engine's capsule shadows.</p></div>
+      <div class="card"><h3>Reflections</h3><p>Screen-space reflections work alongside MSAA.</p></div>
+      <div class="card"><h3>World normals</h3><p>Post-process materials can read SceneTexture WorldNormal in forward.</p></div>
+    </div>
+  </section>
+
+  <section id="videos" hidden>
+    <h2>In motion</h2>
+    <p>Aliasing is worst in motion. The same gameplay before and after.</p>
+    <div class="pair">
+      <figure><video src="video/before.mp4" controls muted loop playsinline preload="metadata"></video><figcaption>Before</figcaption></figure>
+      <figure><video src="video/after.mp4" controls muted loop playsinline preload="metadata"></video><figcaption>After</figcaption></figure>
+    </div>
+  </section>
+
+  <section id="compare">
+    <h2>Compare</h2>
+    <p>The same frame in each mode. Pick a view, then click a mode or press 1 to 5. The lower image is a 3x crop so you can see the edges.</p>
+    <div class="controls" id="views" role="group" aria-label="View"></div>
+    <div class="controls" id="modes" role="group" aria-label="Mode"></div>
+    <p class="modenote" id="modenote"></p>
+    <figure><img id="full" alt="" width="960" height="540"><figcaption id="fullcap"></figcaption></figure>
+    <figure id="zoomfig"><img id="zoom" class="zoom" alt="" width="720" height="405"><figcaption></figcaption></figure>
+  </section>
+
+  <section>
+    <h2>Ambient occlusion</h2>
+    <figure><img src="img/extra_dfao.jpg" alt="Screen-space AO only on the left, plus distance-field AO on the right" width="1930" height="540" loading="lazy"><figcaption>Distance-field AO · left screen-space AO only, right with distance-field AO</figcaption></figure>
+    <figure><img src="img/extra_hfao.jpg" alt="Without and with height-field AO" width="1930" height="540" loading="lazy"><figcaption>Occlusion from buildings · left off, right on. Sidewalks and walls next to tall buildings darken; open street does not</figcaption></figure>
+    <figure><img src="img/extra_capsule.jpg" alt="A character's feet without and with a contact shadow" width="1130" height="520" loading="lazy"><figcaption>Character contact shadow · left off, right on</figcaption></figure>
+    <figure><img src="img/extra_normal.jpg" alt="A scene and its world normals read by a post-process material" width="1940" height="543" loading="lazy"><figcaption>World normals in forward · left the scene, right a post-process material reading WorldNormal</figcaption></figure>
+  </section>
+
+  <section id="start">
+    <h2>Set it up</h2>
+    <p>You need a UE 5.8 source build, and a project on the mobile renderer: <code>bPreferFeatureLevelES31</code> on PC, or a mobile platform.</p>
+    <ol>
+      <li>Download the repository and apply the eight patches in <code>Patches/</code> to the engine, in order, with <code>git apply</code>.</li>
+      <li>Build the editor. The first launch recompiles every material.</li>
+      <li>Add the settings below to <code>Config/DefaultEngine.ini</code> under <code>[/Script/Engine.RendererSettings]</code>, then restart the editor.</li>
+    </ol>
+<pre><code>r.Mobile.ShadingPath=0
+r.Mobile.AntiAliasing=3
+r.MSAACount=4
+r.WideCustomResolve=2
+r.Mobile.MSAA.EdgeAwareFetch=1
+r.Mobile.MSAA.SkipRedundantResolve=1
+r.Mobile.AmbientOcclusion=1
+r.DefaultFeature.AmbientOcclusion=True</code></pre>
+    <p>The <a href="https://github.com/Vaei/ForwardLevelUp#readme">README</a> covers the optional extras (distance-field AO, contact shadows, reflections, occlusion from buildings, world normals), what to check when something doesn't show up, and every setting.</p>
+  </section>
+
+  <section>
+    <h2>Cost</h2>
+    <p>GPU time at 1901x1269 with 4x MSAA, in a city scene in the editor.</p>
+    <div class="tablewrap"><table>
+      <thead><tr><th>Feature</th><th>Cost</th></tr></thead>
+      <tbody>
+        <tr><td>Smoother resolve</td><td class="num">0.014 ms</td></tr>
+        <tr><td>Edge fixes for shadows and AO</td><td class="num">0.003 ms</td></tr>
+        <tr><td>Screen-space AO</td><td class="num">0.07 ms</td></tr>
+        <tr><td>Distance-field AO</td><td class="num">~0.25 ms</td></tr>
+        <tr><td>Occlusion from buildings</td><td class="num">0.18 ms</td></tr>
+        <tr><td>Contact shadows (one character)</td><td class="num">0.026 ms</td></tr>
+        <tr><td>Screen-space reflections</td><td class="num">~0 ms</td></tr>
+        <tr><td>World normals</td><td class="num">~0.07 ms</td></tr>
+      </tbody>
+    </table></div>
+  </section>
+
+  <section>
+    <h2>Under the hood</h2>
+    <details>
+      <summary>What each patch changes</summary>
+      <div class="tablewrap"><table>
+        <thead><tr><th>Patch</th><th>Stock 5.8</th><th>Patched</th></tr></thead>
+        <tbody>
+          <tr><td>1 Wide resolve</td><td>Mobile gets a 1-pixel box filter; the wider resolve only compiles for desktop.</td><td>The wider resolve runs on the mobile renderer (<code>r.WideCustomResolve</code>).</td></tr>
+          <tr><td>2 Distance-field shadow fix</td><td>The distance-field shadow pass is dropped under MSAA, with an ensure at startup.</td><td>Works under MSAA.</td></tr>
+          <tr><td>3 Edge fetch and AO</td><td>Shadows and AO bleed across MSAA edges. Forward reads AO from a channel nothing writes, and mobile SSAO never runs on PC.</td><td>Edge samples fetch from the matching surface (<code>r.Mobile.MSAA.EdgeAwareFetch</code>). Forward gets SSAO.</td></tr>
+          <tr><td>4 Skip resolve</td><td>A hardware resolve runs that the custom resolve then overwrites.</td><td>Optionally skipped (<code>r.Mobile.MSAA.SkipRedundantResolve</code>). Identical output.</td></tr>
+          <tr><td>5 Forward distance-field AO</td><td>Mobile distance-field AO only works in deferred.</td><td>Works in forward (<code>r.Mobile.DistanceFieldAO</code>).</td></tr>
+          <tr><td>6 Contact shadows and SSR fix</td><td>Capsule sky occlusion is disabled on mobile. Mobile SSR crashes with patch 4.</td><td>Capsule occlusion on mobile, optionally cast straight down (<code>r.CapsuleIndirectSkyLightFromAbove</code>). SSR safe under MSAA.</td></tr>
+          <tr><td>7 World normals</td><td>Forward has no normal buffer, so post-process materials cannot read WorldNormal.</td><td>Optional normal target (<code>r.Mobile.Forward.NormalTarget</code>).</td></tr>
+          <tr><td>8 Occlusion from buildings</td><td>Nothing occludes the sky beyond a few metres.</td><td>Sky occlusion from a top-down height capture of the level (<code>r.Mobile.HeightFieldAO</code>).</td></tr>
+        </tbody>
+      </table></div>
+    </details>
+  </section>
+
+  <footer>ForwardLevelUp · patches for Unreal Engine 5.8 · <a href="https://github.com/Vaei/ForwardLevelUp">GitHub</a></footer>
+</div>
+
+<script>
+const VIEWS = { street: "Street", topdown: "Top-down", skyline: "Skyline", character: "Character", lamp_pole: "Lamp pole", fence: "Fence", van: "Van", street_deep: "Long street" };
+const MODES = {
+  deferred: ["Mobile deferred", "UE 5.8's default mobile renderer. It cannot use MSAA."],
+  off: ["Forward, no AA", "Mobile forward with anti-aliasing off."],
+  stock: ["Stock MSAA 4x", "Unpatched 5.8 MSAA: a 1-pixel box resolve, and shadows bleed across edges."],
+  patched: ["ForwardLevelUp", "MSAA 4x with the wider resolve and edge fixes."],
+  ao: ["ForwardLevelUp + AO", "Adds screen-space and distance-field AO."]
+};
+const ZOOM_MODES = ["off", "stock", "patched"];
+let view = "street", mode = "patched";
+
+function button(label, onClick) {
+  const b = document.createElement("button");
+  b.type = "button"; b.textContent = label; b.addEventListener("click", onClick);
+  return b;
+}
+const viewBox = document.getElementById("views"), modeBox = document.getElementById("modes");
+for (const [key, label] of Object.entries(VIEWS)) {
+  const b = button(label, () => { view = key; render(); });
+  b.dataset.key = key; viewBox.append(b);
+}
+Object.entries(MODES).forEach(([key, [label]], i) => {
+  const b = button((i + 1) + "  " + label, () => { mode = key; render(); });
+  b.dataset.key = key; modeBox.append(b);
+});
+function render() {
+  for (const b of viewBox.children) b.setAttribute("aria-pressed", String(b.dataset.key === view));
+  for (const b of modeBox.children) b.setAttribute("aria-pressed", String(b.dataset.key === mode));
+  const full = document.getElementById("full");
+  full.src = "img/" + view + "_" + mode + ".jpg";
+  full.alt = VIEWS[view] + ", " + MODES[mode][0];
+  document.getElementById("fullcap").textContent = VIEWS[view] + " · " + MODES[mode][0];
+  document.getElementById("modenote").textContent = MODES[mode][1];
+  const zm = ZOOM_MODES.includes(mode) ? mode : (mode === "ao" ? "patched" : "off");
+  const zoom = document.getElementById("zoom");
+  zoom.src = "img/" + view + "_" + zm + "_zoom.png";
+  zoom.alt = "Edge crop, " + MODES[zm][0];
+  document.querySelector("#zoomfig figcaption").textContent = "3x crop · " + MODES[zm][0];
+}
+document.addEventListener("keydown", e => {
+  const keys = Object.keys(MODES), i = parseInt(e.key, 10) - 1;
+  if (i >= 0 && i < keys.length) { mode = keys[i]; render(); }
+});
+render();
+
+// The videos section appears once docs/video/before.mp4 exists
+const probe = document.createElement("video");
+probe.preload = "metadata";
+probe.addEventListener("loadedmetadata", () => { document.getElementById("videos").hidden = false; });
+probe.src = "video/before.mp4";
+</script>
+</body>
+</html>

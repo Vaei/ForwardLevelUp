@@ -1,0 +1,364 @@
+diff --git a/Engine/Shaders/Private/MobileHeightFieldAO.usf b/Engine/Shaders/Private/MobileHeightFieldAO.usf
+new file mode 100644
+index 000000000000..914f7860cd86
+--- /dev/null
++++ b/Engine/Shaders/Private/MobileHeightFieldAO.usf
+@@ -0,0 +1,94 @@
++// Copyright (c) 2026 Jared Taylor.
++
++#include "Common.ush"
++
++Texture2D SceneDepthTexture;
++Texture2D HeightTexture;
++SamplerState HeightSampler;
++float4 HeightUVScaleBias;
++float2 HeightWorldSize;
++float HeightTop;
++float MaxDistance;
++float MinDistance;
++float NormalBias;
++float Intensity;
++uint NumDirections;
++uint NumSteps;
++
++float2 GetHeightUV(float2 TranslatedWorldXY)
++{
++	return TranslatedWorldXY.yx * HeightUVScaleBias.xy + HeightUVScaleBias.zw;
++}
++
++float SampleHeight(float2 TranslatedWorldXY)
++{
++	return HeightTop - HeightTexture.SampleLevel(HeightSampler, GetHeightUV(TranslatedWorldXY), 0).a;
++}
++
++float3 PixelToTranslatedWorld(int2 Pixel)
++{
++	const float DeviceZ = SceneDepthTexture.Load(int3(Pixel, 0)).r;
++	const float4 Position = mul(float4(Pixel + 0.5, DeviceZ, 1), View.SVPositionToTranslatedWorld);
++	return Position.xyz / Position.w;
++}
++
++/** Each axis uses the neighbour with the smaller step, so silhouettes do not bend the normal. */
++float3 ReconstructNormal(int2 Pixel, float3 Center)
++{
++	const float3 Left = PixelToTranslatedWorld(Pixel - int2(1, 0));
++	const float3 Right = PixelToTranslatedWorld(Pixel + int2(1, 0));
++	const float3 Up = PixelToTranslatedWorld(Pixel - int2(0, 1));
++	const float3 Down = PixelToTranslatedWorld(Pixel + int2(0, 1));
++
++	const float3 TangentX = length2(Right - Center) < length2(Center - Left) ? Right - Center : Center - Left;
++	const float3 TangentY = length2(Down - Center) < length2(Center - Up) ? Down - Center : Center - Up;
++	const float3 Normal = normalize(cross(TangentY, TangentX));
++	return dot(Normal, Center - View.TranslatedWorldCameraOrigin) > 0 ? -Normal : Normal;
++}
++
++void MainPS(float4 SvPosition : SV_POSITION, out float4 OutColor : SV_Target0)
++{
++	const int2 Pixel = int2(SvPosition.xy);
++	if (SceneDepthTexture.Load(int3(Pixel, 0)).r == FarDepthValue)
++	{
++		OutColor = 1;
++		return;
++	}
++
++	const float3 Position = PixelToTranslatedWorld(Pixel);
++	const float3 Normal = ReconstructNormal(Pixel, Position);
++	const float3 Origin = Position + Normal * NormalBias;
++
++	const float2 UV = GetHeightUV(Origin.xy);
++	const float2 EdgeDistance = min(UV, 1 - UV) * HeightWorldSize;
++	const float EdgeFade = saturate(min(EdgeDistance.x, EdgeDistance.y) / MaxDistance);
++
++	float Visibility = 1;
++	if (EdgeFade > 0)
++	{
++		float VisibilitySum = 0;
++		float WeightSum = 0;
++		for (uint DirectionIndex = 0; DirectionIndex < NumDirections; DirectionIndex++)
++		{
++			float2 Direction;
++			sincos((DirectionIndex + 0.5) * (2 * PI / NumDirections), Direction.y, Direction.x);
++			// Directions into the surface cannot reach the sky, so they count for nothing
++			const float Weight = max(1 + dot(Direction, Normal.xy), 0);
++
++			float MaxSlope = 0;
++			for (uint StepIndex = 0; StepIndex < NumSteps; StepIndex++)
++			{
++				const float Fraction = (StepIndex + 1.0) / NumSteps;
++				const float Distance = lerp(MinDistance, MaxDistance, Fraction * Fraction);
++				MaxSlope = max(MaxSlope, (SampleHeight(Origin.xy + Direction * Distance) - Origin.z) / Distance);
++			}
++
++			// Cosine weighted sky above a horizon of this slope
++			VisibilitySum += Weight / (1 + MaxSlope * MaxSlope);
++			WeightSum += Weight;
++		}
++		Visibility = lerp(1, VisibilitySum / max(WeightSum, 1e-4), Intensity * EdgeFade);
++	}
++
++	OutColor = float4(Visibility, 0, 0, 0);
++}
+diff --git a/Engine/Source/Runtime/Renderer/Private/MobileHeightFieldAO.cpp b/Engine/Source/Runtime/Renderer/Private/MobileHeightFieldAO.cpp
+new file mode 100644
+index 000000000000..0f13863b1f2b
+--- /dev/null
++++ b/Engine/Source/Runtime/Renderer/Private/MobileHeightFieldAO.cpp
+@@ -0,0 +1,181 @@
++// Copyright (c) 2026 Jared Taylor.
++
++#include "MobileHeightFieldAO.h"
++#include "MobileHeightFieldAORendering.h"
++#include "Engine/Texture.h"
++#include "PixelShaderUtils.h"
++#include "ProfilingDebugging/CpuProfilerTrace.h"
++#include "RenderGraphUtils.h"
++#include "RenderTargetPool.h"
++#include "SceneExtensions.h"
++#include "ScenePrivate.h"
++#include "SceneRendering.h"
++#include "TextureResource.h"
++
++static TAutoConsoleVariable<int32> CVarMobileHeightFieldAO(
++	TEXT("r.Mobile.HeightFieldAO"),
++	0,
++	TEXT("Sky occlusion from a top-down height texture set with SetMobileHeightFieldAO, multiplied into mobile ambient occlusion. Needs r.Mobile.AmbientOcclusion."),
++	ECVF_Scalability | ECVF_RenderThreadSafe);
++
++static TAutoConsoleVariable<float> CVarMobileHeightFieldAOMaxDistance(
++	TEXT("r.Mobile.HeightFieldAO.MaxDistance"),
++	3000.0f,
++	TEXT("World distance the horizon search reaches."),
++	ECVF_Scalability | ECVF_RenderThreadSafe);
++
++static TAutoConsoleVariable<float> CVarMobileHeightFieldAOMinDistance(
++	TEXT("r.Mobile.HeightFieldAO.MinDistance"),
++	0.0f,
++	TEXT("World distance the horizon search starts at. Raise it to the distance field AO range to leave near occlusion to DFAO."),
++	ECVF_Scalability | ECVF_RenderThreadSafe);
++
++static TAutoConsoleVariable<float> CVarMobileHeightFieldAOIntensity(
++	TEXT("r.Mobile.HeightFieldAO.Intensity"),
++	1.0f,
++	TEXT("0 disables the occlusion, 1 applies it fully."),
++	ECVF_Scalability | ECVF_RenderThreadSafe);
++
++static TAutoConsoleVariable<float> CVarMobileHeightFieldAONormalBias(
++	TEXT("r.Mobile.HeightFieldAO.NormalBias"),
++	150.0f,
++	TEXT("World distance the search origin moves along the surface normal, so walls and roof eaves do not occlude the wall."),
++	ECVF_Scalability | ECVF_RenderThreadSafe);
++
++static TAutoConsoleVariable<int32> CVarMobileHeightFieldAODirections(
++	TEXT("r.Mobile.HeightFieldAO.Directions"),
++	8,
++	TEXT("Horizon directions per pixel."),
++	ECVF_Scalability | ECVF_RenderThreadSafe);
++
++static TAutoConsoleVariable<int32> CVarMobileHeightFieldAOSteps(
++	TEXT("r.Mobile.HeightFieldAO.Steps"),
++	8,
++	TEXT("Height samples per direction."),
++	ECVF_Scalability | ECVF_RenderThreadSafe);
++
++DECLARE_GPU_STAT_NAMED(MobileHeightFieldAO, TEXT("Height Field AO"));
++
++class FMobileHeightFieldAOSceneExtension : public ISceneExtension
++{
++	DECLARE_SCENE_EXTENSION(, FMobileHeightFieldAOSceneExtension);
++
++public:
++	using ISceneExtension::ISceneExtension;
++
++	TRefCountPtr<IPooledRenderTarget> HeightTexture;
++	FBox WorldBounds = FBox(ForceInit);
++};
++
++IMPLEMENT_SCENE_EXTENSION(FMobileHeightFieldAOSceneExtension);
++
++void SetMobileHeightFieldAO(FSceneInterface* SceneInterface, UTexture* HeightTexture, const FBox& WorldBounds)
++{
++	TRACE_CPUPROFILER_EVENT_SCOPE(MobileHeightFieldAO::SetMobileHeightFieldAO);
++
++	FScene* Scene = SceneInterface ? SceneInterface->GetRenderScene() : nullptr;
++	if (!Scene)
++	{
++		return;
++	}
++
++	FTextureResource* Resource = HeightTexture ? HeightTexture->GetResource() : nullptr;
++	ENQUEUE_RENDER_COMMAND(SetMobileHeightFieldAO)([Scene, Resource, WorldBounds](FRHICommandListImmediate&)
++	{
++		if (FMobileHeightFieldAOSceneExtension* Extension = Scene->GetExtensionPtr<FMobileHeightFieldAOSceneExtension>())
++		{
++			FRHITexture* Texture = Resource ? Resource->GetTextureRHI() : nullptr;
++			Extension->HeightTexture = Texture ? CreateRenderTarget(Texture, TEXT("MobileHeightFieldAO")) : nullptr;
++			Extension->WorldBounds = WorldBounds;
++		}
++	});
++}
++
++class FMobileHeightFieldAOPS : public FGlobalShader
++{
++public:
++	DECLARE_GLOBAL_SHADER(FMobileHeightFieldAOPS);
++	SHADER_USE_PARAMETER_STRUCT(FMobileHeightFieldAOPS, FGlobalShader);
++
++	BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
++		SHADER_PARAMETER_STRUCT_REF(FViewUniformShaderParameters, View)
++		SHADER_PARAMETER_RDG_TEXTURE(Texture2D, SceneDepthTexture)
++		SHADER_PARAMETER_RDG_TEXTURE(Texture2D, HeightTexture)
++		SHADER_PARAMETER_SAMPLER(SamplerState, HeightSampler)
++		SHADER_PARAMETER(FVector4f, HeightUVScaleBias)
++		SHADER_PARAMETER(FVector2f, HeightWorldSize)
++		SHADER_PARAMETER(float, HeightTop)
++		SHADER_PARAMETER(float, MaxDistance)
++		SHADER_PARAMETER(float, MinDistance)
++		SHADER_PARAMETER(float, NormalBias)
++		SHADER_PARAMETER(float, Intensity)
++		SHADER_PARAMETER(uint32, NumDirections)
++		SHADER_PARAMETER(uint32, NumSteps)
++		RENDER_TARGET_BINDING_SLOTS()
++	END_SHADER_PARAMETER_STRUCT()
++
++	static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters& Parameters)
++	{
++		return IsMobilePlatform(Parameters.Platform);
++	}
++};
++
++IMPLEMENT_GLOBAL_SHADER(FMobileHeightFieldAOPS, "/Engine/Private/MobileHeightFieldAO.usf", "MainPS", SF_Pixel);
++
++void RenderMobileHeightFieldAO(FRDGBuilder& GraphBuilder, FScene* Scene, TArrayView<const FViewInfo> Views, FRDGTexture* SceneDepth, FRDGTexture* AmbientOcclusion)
++{
++	TRACE_CPUPROFILER_EVENT_SCOPE(MobileHeightFieldAO::RenderMobileHeightFieldAO);
++
++	const FMobileHeightFieldAOSceneExtension* Extension = Scene ? Scene->GetExtensionPtr<FMobileHeightFieldAOSceneExtension>() : nullptr;
++	const float Intensity = CVarMobileHeightFieldAOIntensity.GetValueOnRenderThread();
++	if (!CVarMobileHeightFieldAO.GetValueOnRenderThread() || !Extension || !Extension->HeightTexture || !Extension->WorldBounds.IsValid || Intensity <= 0.0f || !SceneDepth || !AmbientOcclusion)
++	{
++		return;
++	}
++
++	RDG_EVENT_SCOPE_STAT(GraphBuilder, MobileHeightFieldAO, "MobileHeightFieldAO");
++
++	FRDGTextureRef HeightTexture = GraphBuilder.RegisterExternalTexture(Extension->HeightTexture);
++	const FVector WorldSize = Extension->WorldBounds.GetSize();
++	const float MaxDistance = FMath::Max(CVarMobileHeightFieldAOMaxDistance.GetValueOnRenderThread(), 1.0f);
++
++	for (const FViewInfo& View : Views)
++	{
++		if (View.bIsSceneCapture || View.bIsReflectionCapture || View.bIsPlanarReflection || !View.Family->EngineShowFlags.AmbientOcclusion)
++		{
++			continue;
++		}
++
++		// The shader works in translated world space, so the bounds move by the view's translation
++		const FVector TranslatedMin = Extension->WorldBounds.Min + View.ViewMatrices.GetPreViewTranslation();
++		const FVector TranslatedMax = Extension->WorldBounds.Max + View.ViewMatrices.GetPreViewTranslation();
++
++		FMobileHeightFieldAOPS::FParameters* PassParameters = GraphBuilder.AllocParameters<FMobileHeightFieldAOPS::FParameters>();
++		PassParameters->View = View.ViewUniformBuffer;
++		PassParameters->SceneDepthTexture = SceneDepth;
++		PassParameters->HeightTexture = HeightTexture;
++		PassParameters->HeightSampler = TStaticSamplerState<SF_Bilinear, AM_Clamp, AM_Clamp, AM_Clamp>::GetRHI();
++		PassParameters->HeightUVScaleBias = FVector4f(
++			1.0f / WorldSize.Y, -1.0f / WorldSize.X,
++			-TranslatedMin.Y / WorldSize.Y, TranslatedMax.X / WorldSize.X);
++		PassParameters->HeightWorldSize = FVector2f(WorldSize.Y, WorldSize.X);
++		PassParameters->HeightTop = TranslatedMax.Z;
++		PassParameters->MaxDistance = MaxDistance;
++		PassParameters->MinDistance = FMath::Clamp(CVarMobileHeightFieldAOMinDistance.GetValueOnRenderThread(), 0.0f, MaxDistance);
++		PassParameters->NormalBias = CVarMobileHeightFieldAONormalBias.GetValueOnRenderThread();
++		PassParameters->Intensity = FMath::Min(Intensity, 1.0f);
++		PassParameters->NumDirections = FMath::Clamp(CVarMobileHeightFieldAODirections.GetValueOnRenderThread(), 1, 32);
++		PassParameters->NumSteps = FMath::Clamp(CVarMobileHeightFieldAOSteps.GetValueOnRenderThread(), 1, 32);
++		PassParameters->RenderTargets[0] = FRenderTargetBinding(AmbientOcclusion, ERenderTargetLoadAction::ELoad);
++
++		TShaderMapRef<FMobileHeightFieldAOPS> PixelShader(View.ShaderMap);
++		FPixelShaderUtils::AddFullscreenPass(
++			GraphBuilder,
++			View.ShaderMap,
++			RDG_EVENT_NAME("HeightFieldAO %dx%d", View.ViewRect.Width(), View.ViewRect.Height()),
++			PixelShader,
++			PassParameters,
++			View.ViewRect,
++			TStaticBlendState<CW_RED, BO_Add, BF_DestColor, BF_Zero>::GetRHI());
++	}
++}
+diff --git a/Engine/Source/Runtime/Renderer/Private/MobileHeightFieldAORendering.h b/Engine/Source/Runtime/Renderer/Private/MobileHeightFieldAORendering.h
+new file mode 100644
+index 000000000000..f19526be2979
+--- /dev/null
++++ b/Engine/Source/Runtime/Renderer/Private/MobileHeightFieldAORendering.h
+@@ -0,0 +1,13 @@
++// Copyright (c) 2026 Jared Taylor.
++
++#pragma once
++
++#include "CoreMinimal.h"
++
++class FRDGBuilder;
++class FRDGTexture;
++class FScene;
++class FViewInfo;
++
++/** Multiplies sky occlusion from the scene's top-down height texture into the mobile ambient occlusion texture. */
++void RenderMobileHeightFieldAO(FRDGBuilder& GraphBuilder, FScene* Scene, TArrayView<const FViewInfo> Views, FRDGTexture* SceneDepth, FRDGTexture* AmbientOcclusion);
+diff --git a/Engine/Source/Runtime/Renderer/Private/MobileShadingRenderer.cpp b/Engine/Source/Runtime/Renderer/Private/MobileShadingRenderer.cpp
+index 5f264ddb4f20..adcb6bd8091b 100644
+--- a/Engine/Source/Runtime/Renderer/Private/MobileShadingRenderer.cpp
++++ b/Engine/Source/Runtime/Renderer/Private/MobileShadingRenderer.cpp
+@@ -99,6 +99,7 @@
+ #include "SceneCaptureRendering.h"
+ #include "SceneCulling/SceneCullingRenderer.h"
+ #include "SceneExtensions.h"
++#include "MobileHeightFieldAORendering.h"
+ #include "SceneInterface.h"
+ #include "SceneManagement.h"
+ #include "SceneOcclusion.h"
+@@ -1767,6 +1768,11 @@ void FMobileSceneRenderer::Render(FRDGBuilder& GraphBuilder, const FSceneRenderU
+ 			RenderDistanceFieldLighting(GraphBuilder, SceneTextures, FDistanceFieldAOParameters(OcclusionMaxDistance), DynamicBentNormalAOTextures, false, false, true, bDeferredShading ? nullptr : BasePassTextures.AmbientOcclusionTexture);
+ 		}
+ 
++		if (HasBeenProduced(BasePassTextures.AmbientOcclusionTexture))
++		{
++			RenderMobileHeightFieldAO(GraphBuilder, Scene, Views, SceneTextures.Depth.Resolve, BasePassTextures.AmbientOcclusionTexture);
++		}
++
+ 		// When renderer is in ERendererOutput::DepthPrepassOnly mode, bRequiresShadowProjections is set to false in InitViews()
+ 		if (bRequiresShadowProjections)
+ 		{
+@@ -2999,6 +3005,11 @@ void FMobileSceneRenderer::RenderDeferredMultiPass(FRDGBuilder& GraphBuilder, FS
+ 		RenderDistanceFieldLighting(GraphBuilder, SceneTextures, Parameters, DynamicBentNormalAOTextures, false, false);
+ 	}
+ 
++	if (HasBeenProduced(BasePassTextures.AmbientOcclusionTexture))
++	{
++		RenderMobileHeightFieldAO(GraphBuilder, Scene, Views, SceneTextures.Depth.Resolve, BasePassTextures.AmbientOcclusionTexture);
++	}
++
+ 	if (bRequiresShadowProjections)
+ 	{
+ 		if (!bIsFullDepthPrepassEnabled)
+diff --git a/Engine/Source/Runtime/Renderer/Public/MobileHeightFieldAO.h b/Engine/Source/Runtime/Renderer/Public/MobileHeightFieldAO.h
+new file mode 100644
+index 000000000000..e3b806cc2d91
+--- /dev/null
++++ b/Engine/Source/Runtime/Renderer/Public/MobileHeightFieldAO.h
+@@ -0,0 +1,16 @@
++// Copyright (c) 2026 Jared Taylor.
++
++#pragma once
++
++#include "CoreMinimal.h"
++
++class FSceneInterface;
++class UTexture;
++
++/**
++ * Sets the top-down height texture that r.Mobile.HeightFieldAO samples, or clears it when HeightTexture is null.
++ * A holds the distance below WorldBounds.Max.Z, as written by an orthographic SceneColorSceneDepth capture placed at the top
++ * of the bounds with rotation (Pitch -90, Yaw 0, Roll 0). U runs along world +Y and V along world -X.
++ * The texture must stay alive until it is cleared.
++ */
++RENDERER_API void SetMobileHeightFieldAO(FSceneInterface* Scene, UTexture* HeightTexture, const FBox& WorldBounds);

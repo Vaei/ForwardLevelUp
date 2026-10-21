@@ -1,0 +1,73 @@
+diff --git a/Engine/Shaders/Private/WideCustomResolveShaders.usf b/Engine/Shaders/Private/WideCustomResolveShaders.usf
+index 2e70e2847491..80b2740cd9cb 100644
+--- a/Engine/Shaders/Private/WideCustomResolveShaders.usf
++++ b/Engine/Shaders/Private/WideCustomResolveShaders.usf
+@@ -76,10 +76,24 @@ float3 resolve_bspline(uint2 pos)
+ #  error "Unknown filter width"
+ # endif
+ 
++#ifndef WIDE_RESOLVE_KEEP_ALPHA
++#define WIDE_RESOLVE_KEEP_ALPHA 0
++#endif
++
+ float4 WideCustomResolvePS(float4 Pos : SV_POSITION) : SV_Target0
+ {
+ 	uint2 P = uint2(ResolveOrigin + Pos.xy);
+-	return float4(resolve_bspline(P), 0);
++	float Alpha = 0;
++#if WIDE_RESOLVE_KEEP_ALPHA
++	// The mobile renderer reads scene color alpha downstream, so box-resolve it from this pixel's own samples
++	UNROLL
++	for (int SampleIndex = 0; SampleIndex < MSAA_SAMPLE_COUNT; ++SampleIndex)
++	{
++		Alpha += Tex.Load(P, SampleIndex).a;
++	}
++	Alpha /= MSAA_SAMPLE_COUNT;
++#endif
++	return float4(resolve_bspline(P), Alpha);
+ }
+ 
+ # endif
+diff --git a/Engine/Source/Runtime/Renderer/Private/WideCustomResolveShaders.h b/Engine/Source/Runtime/Renderer/Private/WideCustomResolveShaders.h
+index 61b0fc276c81..4a8c7c4480e5 100644
+--- a/Engine/Source/Runtime/Renderer/Private/WideCustomResolveShaders.h
++++ b/Engine/Source/Runtime/Renderer/Private/WideCustomResolveShaders.h
+@@ -9,6 +9,12 @@
+ #include "ShaderParameterUtils.h"
+ #include "DataDrivenShaderPlatformInfo.h"
+ 
++/** Desktop, plus the mobile renderer on PC where MSAA targets can be loaded per sample. */
++inline bool SupportsWideCustomResolve(const FStaticShaderPlatform Platform)
++{
++	return IsFeatureLevelSupported(Platform, ERHIFeatureLevel::SM5) || (IsMobilePlatform(Platform) && (IsPCPlatform(Platform) || IsSimulatedPlatform(Platform)));
++}
++
+ class FWideCustomResolveVS : public FGlobalShader
+ {
+ 	DECLARE_SHADER_TYPE(FWideCustomResolveVS,Global);
+@@ -21,7 +27,7 @@ public:
+ 
+ 	static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters& Parameters)
+ 	{
+-		return IsFeatureLevelSupported(Parameters.Platform, ERHIFeatureLevel::SM5);
++		return SupportsWideCustomResolve(Parameters.Platform);
+ 	}
+ };
+ 
+@@ -47,7 +53,7 @@ public:
+ 
+ 	static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters& Parameters)
+ 	{
+-		return IsFeatureLevelSupported(Parameters.Platform, ERHIFeatureLevel::SM5);
++		return SupportsWideCustomResolve(Parameters.Platform);
+ 	}
+ 
+ 	void SetParameters(FRHIBatchedShaderParameters& BatchedParameters, FRHITexture* Texture2DMS, FRHIShaderResourceView* FmaskSRV, FIntPoint Origin)
+@@ -66,6 +72,7 @@ public:
+ 		OutEnvironment.SetDefine(TEXT("WIDE_RESOLVE_WIDTH"), Width);
+ 		OutEnvironment.SetDefine(TEXT("MSAA_SAMPLE_COUNT"), MSAASampleCount);
+ 		OutEnvironment.SetDefine(TEXT("USE_FMASK"), UseFMask);
++		OutEnvironment.SetDefine(TEXT("WIDE_RESOLVE_KEEP_ALPHA"), IsMobilePlatform(Parameters.Platform));
+ 	}
+ 
+ protected:

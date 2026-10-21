@@ -1,0 +1,231 @@
+diff --git a/Engine/Shaders/Private/DistanceFieldAOShared.ush b/Engine/Shaders/Private/DistanceFieldAOShared.ush
+index a67c44910b51..3f71a4175c0f 100644
+--- a/Engine/Shaders/Private/DistanceFieldAOShared.ush
++++ b/Engine/Shaders/Private/DistanceFieldAOShared.ush
+@@ -224,6 +224,43 @@ float2 GetScreenUVFromScreenGrid(uint2 OutputCoordinate)
+ 
+ StructuredBuffer<uint> CulledTilesStartOffsetArray;
+ 
++#ifndef DFAO_RECONSTRUCT_NORMAL
++#define DFAO_RECONSTRUCT_NORMAL 0
++#endif
++
++#if DFAO_RECONSTRUCT_NORMAL
++float3 DFAOScreenUVToTranslatedWorld(float2 ScreenUV, float SceneDepth)
++{
++	float2 ScreenPosition = (ScreenUV - View.ScreenPositionScaleBias.wz) / View.ScreenPositionScaleBias.xy;
++	return mul(float4(GetScreenPositionForProjectionType(ScreenPosition, SceneDepth), SceneDepth, 1), View.ScreenToTranslatedWorld).xyz;
++}
++
++/** World normal from depth. Each axis uses the neighbour with the smaller depth step, so silhouettes do not bend the normal. */
++float3 ReconstructWorldNormalFromDepth(float2 ScreenUV)
++{
++	const float2 TexelSize = View.BufferSizeAndInvSize.zw;
++	const float2 DX = float2(TexelSize.x, 0);
++	const float2 DY = float2(0, TexelSize.y);
++
++	const float Center = CalcSceneDepth(ScreenUV);
++	const float Left = CalcSceneDepth(ScreenUV - DX);
++	const float Right = CalcSceneDepth(ScreenUV + DX);
++	const float Up = CalcSceneDepth(ScreenUV - DY);
++	const float Down = CalcSceneDepth(ScreenUV + DY);
++
++	const float3 Position = DFAOScreenUVToTranslatedWorld(ScreenUV, Center);
++	const float3 TangentX = abs(Right - Center) < abs(Center - Left)
++		? DFAOScreenUVToTranslatedWorld(ScreenUV + DX, Right) - Position
++		: Position - DFAOScreenUVToTranslatedWorld(ScreenUV - DX, Left);
++	const float3 TangentY = abs(Down - Center) < abs(Center - Up)
++		? DFAOScreenUVToTranslatedWorld(ScreenUV + DY, Down) - Position
++		: Position - DFAOScreenUVToTranslatedWorld(ScreenUV - DY, Up);
++
++	const float3 Normal = normalize(cross(TangentY, TangentX));
++	return dot(Normal, Position - View.TranslatedWorldCameraOrigin) > 0 ? -Normal : Normal;
++}
++#endif
++
+ #define INVALID_TILE_INDEX 0xFFFF
+ 
+ #ifndef CULLED_TILE_DATA_STRIDE
+diff --git a/Engine/Shaders/Private/DistanceFieldLightingPost.usf b/Engine/Shaders/Private/DistanceFieldLightingPost.usf
+index 7d4f204f7bc5..4c7c2b9b8408 100644
+--- a/Engine/Shaders/Private/DistanceFieldLightingPost.usf
++++ b/Engine/Shaders/Private/DistanceFieldLightingPost.usf
+@@ -368,15 +368,22 @@ void AOUpsamplePS(
+ 	,out float4 OutSceneColor : SV_Target0
+ 	)
+ {
++#if DFAO_RECONSTRUCT_NORMAL
++	const float SceneDepth = CalcSceneDepth(UVAndScreenPos.xy);
++	const float3 WorldNormal = ReconstructWorldNormalFromDepth(UVAndScreenPos.xy);
++#else
+ #if SHADING_PATH_MOBILE
+ 	FGBufferData GBuffer = MobileFetchAndDecodeGBuffer(UVAndScreenPos.xy, UVAndScreenPos.zw);
+ #else
+ 	FGBufferData GBuffer = GetGBufferData(UVAndScreenPos.xy);
++#endif
++	const float SceneDepth = GBuffer.Depth;
++	const float3 WorldNormal = GBuffer.WorldNormal;
+ #endif
+ 	// The rectangle is drawn according to GBuffer rect,
+ 	// while the bent normal is always offset at (0, 0)
+ 	const float2 BentNormalUV = UVAndScreenPos.xy - View.ViewRectMin.xy * View.BufferSizeAndInvSize.zw;
+-	float3 BentNormal = UpsampleDFAO(BentNormalUV, GBuffer.Depth, GBuffer.WorldNormal);
++	float3 BentNormal = UpsampleDFAO(BentNormalUV, SceneDepth, WorldNormal);
+ 
+ #if MODULATE_SCENE_COLOR
+ 	float Visibility = lerp(length(BentNormal), 1.0f, MinIndirectDiffuseOcclusion);
+diff --git a/Engine/Shaders/Private/DistanceFieldScreenGridLighting.usf b/Engine/Shaders/Private/DistanceFieldScreenGridLighting.usf
+index 5d09b5bc944d..aefef5979157 100644
+--- a/Engine/Shaders/Private/DistanceFieldScreenGridLighting.usf
++++ b/Engine/Shaders/Private/DistanceFieldScreenGridLighting.usf
+@@ -25,6 +25,8 @@ void ComputeDistanceFieldNormalPS(
+ 
+ #if SUBSTRATE_GBUFFER_FORMAT==1 
+ 	float3 WorldNormal = SubstrateUnpackTopLayerData(Substrate.TopLayerTexture.Load(uint3(PixelCoord, 0))).WorldNormal;
++#elif DFAO_RECONSTRUCT_NORMAL
++	float3 WorldNormal = ReconstructWorldNormalFromDepth(ScreenUV);
+ #else
+ #if SHADING_PATH_MOBILE
+ 	FGBufferData GBuffer = MobileFetchAndDecodeGBuffer(ScreenUV, PixelCoord);
+@@ -52,6 +54,8 @@ void ComputeDistanceFieldNormalCS(
+ 
+ #if SUBSTRATE_GBUFFER_FORMAT==1 
+ 	float3 WorldNormal = SubstrateUnpackTopLayerData(Substrate.TopLayerTexture.Load(uint3(PixelCoord, 0))).WorldNormal;
++#elif DFAO_RECONSTRUCT_NORMAL
++	float3 WorldNormal = ReconstructWorldNormalFromDepth(ScreenUV);
+ #else
+ #if SHADING_PATH_MOBILE
+ 	FGBufferData GBuffer = MobileFetchAndDecodeGBuffer(ScreenUV, PixelCoord);
+diff --git a/Engine/Source/Runtime/Renderer/Private/DistanceFieldAmbientOcclusion.cpp b/Engine/Source/Runtime/Renderer/Private/DistanceFieldAmbientOcclusion.cpp
+index 87d2e33f4eaf..967ad5b1ba46 100644
+--- a/Engine/Source/Runtime/Renderer/Private/DistanceFieldAmbientOcclusion.cpp
++++ b/Engine/Source/Runtime/Renderer/Private/DistanceFieldAmbientOcclusion.cpp
+@@ -371,6 +371,7 @@ public:
+ 		OutEnvironment.SetDefine(TEXT("DOWNSAMPLE_FACTOR"), GAODownsampleFactor);
+ 		OutEnvironment.SetDefine(TEXT("THREADGROUP_SIZEX"), GDistanceFieldAOTileSizeX);
+ 		OutEnvironment.SetDefine(TEXT("THREADGROUP_SIZEY"), GDistanceFieldAOTileSizeY);
++		OutEnvironment.SetDefine(TEXT("DFAO_RECONSTRUCT_NORMAL"), DistanceFieldAOReconstructsNormals(Parameters.Platform));
+ 	}
+ };
+ 
+@@ -400,6 +401,7 @@ public:
+ 		OutEnvironment.SetDefine(TEXT("DOWNSAMPLE_FACTOR"), GAODownsampleFactor);
+ 		OutEnvironment.SetDefine(TEXT("THREADGROUP_SIZEX"), GDistanceFieldAOTileSizeX);
+ 		OutEnvironment.SetDefine(TEXT("THREADGROUP_SIZEY"), GDistanceFieldAOTileSizeY);
++		OutEnvironment.SetDefine(TEXT("DFAO_RECONSTRUCT_NORMAL"), DistanceFieldAOReconstructsNormals(Parameters.Platform));
+ 	}
+ };
+ 
+@@ -701,6 +703,11 @@ bool SupportsDistanceFieldAO(ERHIFeatureLevel::Type FeatureLevel, EShaderPlatfor
+ 		&& IsUsingDistanceFields(ShaderPlatform);
+ }
+ 
++bool DistanceFieldAOReconstructsNormals(EShaderPlatform ShaderPlatform)
++{
++	return IsMobilePlatform(ShaderPlatform) && !IsMobileDeferredShadingEnabled(ShaderPlatform);
++}
++
+ bool ShouldRenderDeferredDynamicSkyLight(const FScene* Scene, const FSceneViewFamily& ViewFamily)
+ {
+ 	return Scene->SkyLight
+@@ -896,7 +903,8 @@ void FSceneRenderer::RenderDistanceFieldLighting(
+ 	TArray<FRDGTextureRef>& OutDynamicBentNormalAOTextures,
+ 	bool bModulateToSceneColor,
+ 	bool bVisualizeAmbientOcclusion,
+-	bool bModulateToScreenSpaceAO)
++	bool bModulateToScreenSpaceAO,
++	FRDGTextureRef ScreenSpaceAOTarget)
+ {
+ 	check(ShouldRenderDistanceFieldLighting(Scene->DistanceFieldSceneData, Views));
+ 	check(!Scene->DistanceFieldSceneData.HasPendingOperations());
+@@ -982,7 +990,7 @@ void FSceneRenderer::RenderDistanceFieldLighting(
+ 		// Upsample to full resolution, write to output in case of debug AO visualization or scene color modulation (standard upsampling is done later together with sky lighting and reflection environment)
+ 		if (bModulateToSceneColor || bModulateToScreenSpaceAO || bVisualizeAmbientOcclusion)
+ 		{
+-			UpsampleBentNormalAO(GraphBuilder, View, SceneTextures, bModulateToScreenSpaceAO ? SceneTextures.ScreenSpaceAO: SceneTextures.Color.Target, PerViewBentNormal, bModulateToSceneColor && !bVisualizeAmbientOcclusion, bModulateToScreenSpaceAO && !bVisualizeAmbientOcclusion);
++			UpsampleBentNormalAO(GraphBuilder, View, SceneTextures, bModulateToScreenSpaceAO ? (ScreenSpaceAOTarget ? ScreenSpaceAOTarget : SceneTextures.ScreenSpaceAO) : SceneTextures.Color.Target, PerViewBentNormal, bModulateToSceneColor && !bVisualizeAmbientOcclusion, bModulateToScreenSpaceAO && !bVisualizeAmbientOcclusion);
+ 		}
+ 
+ 		OutDynamicBentNormalAOTextures.Add(PerViewBentNormal);
+diff --git a/Engine/Source/Runtime/Renderer/Private/DistanceFieldLightingPost.cpp b/Engine/Source/Runtime/Renderer/Private/DistanceFieldLightingPost.cpp
+index 22e7054684c9..af8af2168210 100644
+--- a/Engine/Source/Runtime/Renderer/Private/DistanceFieldLightingPost.cpp
++++ b/Engine/Source/Runtime/Renderer/Private/DistanceFieldLightingPost.cpp
+@@ -551,6 +551,12 @@ public:
+ 	{
+ 		return ShouldCompileDFLightingPostShaders(Parameters.Platform);
+ 	}
++
++	static void ModifyCompilationEnvironment(const FGlobalShaderPermutationParameters& Parameters, FShaderCompilerEnvironment& OutEnvironment)
++	{
++		FGlobalShader::ModifyCompilationEnvironment(Parameters, OutEnvironment);
++		OutEnvironment.SetDefine(TEXT("DFAO_RECONSTRUCT_NORMAL"), DistanceFieldAOReconstructsNormals(Parameters.Platform));
++	}
+ };
+ 
+ IMPLEMENT_GLOBAL_SHADER(FDistanceFieldAOUpsamplePS, "/Engine/Private/DistanceFieldLightingPost.usf", "AOUpsamplePS", SF_Pixel);
+@@ -611,7 +617,7 @@ void UpsampleBentNormalAO(
+ 			SetGraphicsPipelineState(RHICmdList, GraphicsPSOInit, 0);
+ 			SetShaderParameters(RHICmdList, PixelShader, PixelShader.GetPixelShader(), *PassParameters);
+ 
+-			const int32 DownsampleFactor = bModulateToScreenSpaceAO ? 1.f : GAODownsampleFactor;
++			const int32 DownsampleFactor = bModulateToScreenSpaceAO && !DistanceFieldAOReconstructsNormals(View.GetShaderPlatform()) ? 1.f : GAODownsampleFactor;
+ 			DrawRectangle(
+ 				RHICmdList,
+ 				0, 0,
+diff --git a/Engine/Source/Runtime/Renderer/Private/DistanceFieldLightingShared.h b/Engine/Source/Runtime/Renderer/Private/DistanceFieldLightingShared.h
+index 81a69cd86783..f1de65bc335a 100644
+--- a/Engine/Source/Runtime/Renderer/Private/DistanceFieldLightingShared.h
++++ b/Engine/Source/Runtime/Renderer/Private/DistanceFieldLightingShared.h
+@@ -160,4 +160,7 @@ extern bool ShouldRenderDistanceFieldAO(TConstArrayView<FViewInfo> Views, const
+ 
+ extern bool SupportsDistanceFieldAO(ERHIFeatureLevel::Type FeatureLevel, EShaderPlatform ShaderPlatform);
+ 
++/** Mobile forward has no normal target, so DFAO rebuilds normals from the depth buffer. */
++extern bool DistanceFieldAOReconstructsNormals(EShaderPlatform ShaderPlatform);
++
+ extern bool ShouldRenderDistanceFieldLighting(const FDistanceFieldSceneData& SceneData, TConstArrayView<FViewInfo> Views);
+\ No newline at end of file
+diff --git a/Engine/Source/Runtime/Renderer/Private/MobileShadingRenderer.cpp b/Engine/Source/Runtime/Renderer/Private/MobileShadingRenderer.cpp
+index 11f4009391bd..333c24cff1f9 100644
+--- a/Engine/Source/Runtime/Renderer/Private/MobileShadingRenderer.cpp
++++ b/Engine/Source/Runtime/Renderer/Private/MobileShadingRenderer.cpp
+@@ -728,7 +728,9 @@ void FMobileSceneRenderer::InitViews(
+ 		&& ShouldRenderDistanceFieldAO(Views, ViewFamily.EngineShowFlags, AnyViewHasGIMethodSupportingDFAO())
+ 		&& ShouldRenderDistanceFieldLighting(Scene->DistanceFieldSceneData, Views)
+ 		&& ViewFamily.EngineShowFlags.AmbientOcclusion
+-		&& (!Views[0].bIsReflectionCapture || Views[0].IsRuntimeReflectionCapture());
++		&& (!Views[0].bIsReflectionCapture || Views[0].IsRuntimeReflectionCapture())
++		// Forward has no ScreenSpaceAO target; DFAO lands in the mobile SSAO texture instead
++		&& (bDeferredShading || IsMobileAmbientOcclusionEnabled(ShaderPlatform));
+ 	
+ 	// Depth is needed for Editor Primitives
+ 	if (bShouldCompositeEditorPrimitives)
+@@ -1754,11 +1756,11 @@ void FMobileSceneRenderer::Render(FRDGBuilder& GraphBuilder, const FSceneRenderU
+ 			BasePassTextures.AmbientOcclusionTexture = RenderAmbientOcclusion(GraphBuilder, SceneTextures);
+ 		}
+ 
+-		if (bEnableDistanceFieldAO && (!bDeferredShading || !bRequiresMultiPass))
++		if (bEnableDistanceFieldAO && (!bDeferredShading || !bRequiresMultiPass) && (bDeferredShading || HasBeenProduced(BasePassTextures.AmbientOcclusionTexture)))
+ 		{
+ 			TArray<FRDGTextureRef> DynamicBentNormalAOTextures;
+ 			const float OcclusionMaxDistance = Scene->SkyLight && !Scene->SkyLight->bWantsStaticShadowing ? Scene->SkyLight->OcclusionMaxDistance : Scene->DefaultMaxDistanceFieldOcclusionDistance;
+-			RenderDistanceFieldLighting(GraphBuilder, SceneTextures, FDistanceFieldAOParameters(OcclusionMaxDistance), DynamicBentNormalAOTextures, false, false, true);
++			RenderDistanceFieldLighting(GraphBuilder, SceneTextures, FDistanceFieldAOParameters(OcclusionMaxDistance), DynamicBentNormalAOTextures, false, false, true, bDeferredShading ? nullptr : BasePassTextures.AmbientOcclusionTexture);
+ 		}
+ 
+ 		// When renderer is in ERendererOutput::DepthPrepassOnly mode, bRequiresShadowProjections is set to false in InitViews()
+diff --git a/Engine/Source/Runtime/Renderer/Private/SceneRendering.h b/Engine/Source/Runtime/Renderer/Private/SceneRendering.h
+index f606e4ce71c7..f4b05d8d8fe4 100644
+--- a/Engine/Source/Runtime/Renderer/Private/SceneRendering.h
++++ b/Engine/Source/Runtime/Renderer/Private/SceneRendering.h
+@@ -2477,7 +2477,8 @@ public:
+ 		TArray<FRDGTextureRef>& OutDynamicBentNormalAOTextures,
+ 		bool bModulateToSceneColor,
+ 		bool bVisualizeAmbientOcclusion,
+-		bool bModulateToScreenSpaceAO = false);
++		bool bModulateToScreenSpaceAO = false,
++		FRDGTextureRef ScreenSpaceAOTarget = nullptr);
+ 
+ 	void SetupVolumetricFog();
+ 

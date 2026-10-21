@@ -1,0 +1,135 @@
+diff --git a/Engine/Shaders/Private/MobileBasePassPixelShader.usf b/Engine/Shaders/Private/MobileBasePassPixelShader.usf
+index b86c27781ca9..d28878493112 100644
+--- a/Engine/Shaders/Private/MobileBasePassPixelShader.usf
++++ b/Engine/Shaders/Private/MobileBasePassPixelShader.usf
+@@ -443,6 +443,9 @@ void Main(
+ 	#else
+ 		// Mobile SSAO renders into its own texture; nothing writes the shadow mask's alpha in forward
+ 		half GatheredAmbientOcclusion = Texture2DSampleLevel(MobileBasePass.AmbientOcclusionTexture, MobileBasePass.AmbientOcclusionSampler, ScreenSpaceBufferUV, 0).r;
++		// Capsule sky occlusion lands in this texture too, so casters see their own capsules at reduced strength
++		const bool bHasCapsuleRepresentation = (GetPrimitiveData(MaterialParameters).Flags & PRIMITIVE_SCENE_DATA_FLAG_HAS_CAPSULE_REPRESENTATION) != 0;
++		GatheredAmbientOcclusion = lerp(1.0, GatheredAmbientOcclusion, bHasCapsuleRepresentation ? View.IndirectCapsuleSelfShadowingIntensity : 1.0);
+ 	#endif
+ 		#if ALLOW_STATIC_LIGHTING
+ 			GatheredAmbientOcclusion = lerp(1.0, GatheredAmbientOcclusion, MobileBasePass.AmbientOcclusionStaticFraction);
+diff --git a/Engine/Source/Runtime/Renderer/Private/CapsuleShadowRendering.cpp b/Engine/Source/Runtime/Renderer/Private/CapsuleShadowRendering.cpp
+index 6daaf086195b..8837f4fc7aba 100644
+--- a/Engine/Source/Runtime/Renderer/Private/CapsuleShadowRendering.cpp
++++ b/Engine/Source/Runtime/Renderer/Private/CapsuleShadowRendering.cpp
+@@ -81,6 +81,16 @@ FAutoConsoleVariableRef CVarCapsuleMaxIndirectOcclusionDistance(
+ 	ECVF_Scalability | ECVF_RenderThreadSafe
+ 	);
+ 
++int32 GCapsuleIndirectSkyLightFromAbove = 0;
++FAutoConsoleVariableRef CVarCapsuleIndirectSkyLightFromAbove(
++	TEXT("r.CapsuleIndirectSkyLightFromAbove"),
++	GCapsuleIndirectSkyLightFromAbove,
++	TEXT("Movable sky lights cast indirect capsule shadows straight down instead of from the sky's brightest direction, for contact occlusion under characters.\n")
++	TEXT("0: off (stock)\n")
++	TEXT("1: on"),
++	ECVF_Scalability | ECVF_RenderThreadSafe
++	);
++
+ float GCapsuleShadowFadeAngleFromVertical = PI / 3;
+ FAutoConsoleVariableRef CVarCapsuleShadowFadeAngleFromVertical(
+ 	TEXT("r.CapsuleShadowFadeAngleFromVertical"),
+@@ -272,7 +282,8 @@ public:
+ 
+ 		OutEnvironment.SetDefine(TEXT("LIGHT_SOURCE_MODE"), (uint32)LightSourceMode);
+ 		const bool bMovableSkyLightCulling = (ShadowingType == ECapsuleShadowingType::MovableSkylightTiledCulling || ShadowingType == ECapsuleShadowingType::MovableSkylightTiledCullingGatherFromReceiverBentNormal);
+-		const bool bApplyToBentNormal = !IsMobilePlatform(Parameters.Platform) ? bMovableSkyLightCulling : false;
++		// Mobile has no receiver bent normal, only the movable sky light path that occludes the DFAO bent normal
++		const bool bApplyToBentNormal = !IsMobilePlatform(Parameters.Platform) ? bMovableSkyLightCulling : (IsMobileDistanceFieldAOEnabled(Parameters.Platform) && ShadowingType == ECapsuleShadowingType::MovableSkylightTiledCulling);
+ 		OutEnvironment.SetDefine(TEXT("APPLY_TO_BENT_NORMAL"), bApplyToBentNormal);
+ 
+ 		EIndirectShadowingPrimitiveTypes PrimitiveTypes = PermutationVector.Get<FIndirectPrimitiveType>();
+@@ -692,7 +703,7 @@ bool FSceneRenderer::RenderCapsuleDirectShadows(
+ 	return true;
+ }
+ 
+-void FDeferredShadingSceneRenderer::CreateIndirectCapsuleShadows()
++void FSceneRenderer::CreateIndirectCapsuleShadows()
+ {
+ 	QUICK_SCOPE_CYCLE_COUNTER(STAT_CreateIndirectCapsuleShadows);
+ 
+@@ -781,7 +792,8 @@ static IndirectCapsuleShadowsResources CreateIndirectCapsuleShadowsResources(
+ 	CapsuleLightSourceData.Reset();
+ 	DistanceFieldCasterLightSourceData.Reset();
+ 
+-	const bool bComputeLightDataFromVolumetricLightmapOrGpuSkyEnvMapIrradiance = Scene && (Scene->VolumetricLightmapSceneData.HasData() || (Scene->SkyLight && Scene->SkyLight->bRealTimeCaptureEnabled));
++	// FComputeLightDirectionFromVolumetricLightmapCS is not compiled for mobile
++	const bool bComputeLightDataFromVolumetricLightmapOrGpuSkyEnvMapIrradiance = Scene && !IsMobilePlatform(View.GetShaderPlatform()) && (Scene->VolumetricLightmapSceneData.HasData() || (Scene->SkyLight && Scene->SkyLight->bRealTimeCaptureEnabled));
+ 
+ 	for (int32 PrimitiveIndex = 0; PrimitiveIndex < View.IndirectShadowPrimitives.Num(); PrimitiveIndex++)
+ 	{
+@@ -814,7 +826,7 @@ static IndirectCapsuleShadowsResources CreateIndirectCapsuleShadowsResources(
+ 		{
+ 			// Movable sky light case
+ 			const FSHVector2 SkyLightingIntensity = FSHVectorRGB2(SkyLight->IrradianceEnvironmentMap).GetLuminance();
+-			const FVector ExtractedMaxDirection = SkyLightingIntensity.GetMaximumDirection();
++			const FVector ExtractedMaxDirection = GCapsuleIndirectSkyLightFromAbove ? FVector::UpVector : SkyLightingIntensity.GetMaximumDirection();
+ 
+ 			// Get the indirect shadow direction from the primary sky lighting direction
+ 			PackedLightDirection = FVector4f((FVector3f)ExtractedMaxDirection, GCapsuleIndirectConeAngle);
+diff --git a/Engine/Source/Runtime/Renderer/Private/CapsuleShadowRendering.h b/Engine/Source/Runtime/Renderer/Private/CapsuleShadowRendering.h
+index 225d1443dc8e..20a4cf22b948 100644
+--- a/Engine/Source/Runtime/Renderer/Private/CapsuleShadowRendering.h
++++ b/Engine/Source/Runtime/Renderer/Private/CapsuleShadowRendering.h
+@@ -26,5 +26,6 @@ inline bool IsCapsuleDirectShadowsEnabled(FStaticShaderPlatform ShaderPlatform)
+ 
+ inline bool SupportsCapsuleIndirectShadows(FStaticShaderPlatform ShaderPlatform)
+ {
+-	return GCapsuleIndirectShadows && IsCapsuleShadowsEnabled(ShaderPlatform) && !IsMobilePlatform(ShaderPlatform);
++	// Mobile only supports the movable sky light path, which occludes the distance field AO bent normal
++	return GCapsuleIndirectShadows && IsCapsuleShadowsEnabled(ShaderPlatform) && (!IsMobilePlatform(ShaderPlatform) || IsMobileDistanceFieldAOEnabled(ShaderPlatform));
+ }
+diff --git a/Engine/Source/Runtime/Renderer/Private/DeferredShadingRenderer.h b/Engine/Source/Runtime/Renderer/Private/DeferredShadingRenderer.h
+index a0f3506df290..52c86ac7f1cd 100644
+--- a/Engine/Source/Runtime/Renderer/Private/DeferredShadingRenderer.h
++++ b/Engine/Source/Runtime/Renderer/Private/DeferredShadingRenderer.h
+@@ -583,8 +583,6 @@ private:
+ 		LumenRadianceCache::FRadianceCacheInterpolationParameters& RadianceCacheParameters,
+ 		ERDGPassFlags ComputePassFlags);
+ 
+-	void CreateIndirectCapsuleShadows();
+-
+ 	void RenderPrePass(FRDGBuilder& GraphBuilder, TArrayView<FViewInfo> InViews, FRDGTextureRef SceneDepthTexture, FInstanceCullingManager& InstanceCullingManager, FRDGTextureRef* FirstStageDepthBuffer);
+ 	void RenderPrePassHMD(FRDGBuilder& GraphBuilder, TArrayView<FViewInfo> InViews, FRDGTextureRef SceneDepthTexture);
+ 
+diff --git a/Engine/Source/Runtime/Renderer/Private/MobileShadingRenderer.cpp b/Engine/Source/Runtime/Renderer/Private/MobileShadingRenderer.cpp
+index 333c24cff1f9..8c5b3d3cde5e 100644
+--- a/Engine/Source/Runtime/Renderer/Private/MobileShadingRenderer.cpp
++++ b/Engine/Source/Runtime/Renderer/Private/MobileShadingRenderer.cpp
+@@ -819,6 +819,8 @@ void FMobileSceneRenderer::InitViews(
+ 		}		
+ 	}
+ 
++	CreateIndirectCapsuleShadows();
++
+ 	if (bRendererOutputFinalSceneColor || bShadowOnlyTimeslice)
+ 	{
+ 		const bool bDynamicShadows = ViewFamily.EngineShowFlags.DynamicShadows;
+@@ -2426,7 +2428,9 @@ void FMobileSceneRenderer::RenderForwardMultiPass(FRDGBuilder& GraphBuilder, FMo
+ 	SecondPassParameters->RenderTargets[1] = FRenderTargetBinding();
+ 	// AddResolveSceneColorPass below rewrites Color.Resolve from the MSAA target whenever the target is separate and not memoryless.
+ 	// The first pass keeps its hardware resolve because scene color copies (water, distortion) read it between the passes.
++	// Mobile SSR traces last frame's resolved color, which crashes in D3D11 without this resolve.
+ 	if (CVarMobileMSAASkipRedundantResolve.GetValueOnRenderThread() != 0
++		&& !IsMobileSSREnabled(View)
+ 		&& SceneTextures.Color.IsSeparate()
+ 		&& SceneTextures.Color.Target->Desc.NumSamples > 1
+ 		&& !EnumHasAnyFlags(SceneTextures.Color.Target->Desc.Flags, TexCreate_Memoryless)
+diff --git a/Engine/Source/Runtime/Renderer/Private/SceneRendering.h b/Engine/Source/Runtime/Renderer/Private/SceneRendering.h
+index f4b05d8d8fe4..fb4e5ac0f252 100644
+--- a/Engine/Source/Runtime/Renderer/Private/SceneRendering.h
++++ b/Engine/Source/Runtime/Renderer/Private/SceneRendering.h
+@@ -2451,6 +2451,9 @@ public:
+ 		TConstArrayView<const FLightSceneInfo*> RayTracedLightsToInject,
+ 		FRDGTexture*& OutLocalShadowedLightScattering);
+ 
++	/** Gathers the primitives that cast indirect capsule shadows into each view. */
++	void CreateIndirectCapsuleShadows();
++
+ 	/** Renders capsule shadows for movable skylights, using the cone of visibility (bent normal) from DFAO. */
+ 	void RenderCapsuleShadowsForMovableSkylight(
+ 		FRDGBuilder& GraphBuilder,

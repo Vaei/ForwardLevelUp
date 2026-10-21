@@ -1,0 +1,141 @@
+diff --git a/Engine/Shaders/Private/MobileBasePassPixelShader.usf b/Engine/Shaders/Private/MobileBasePassPixelShader.usf
+index 0c8081fa43f3..b86c27781ca9 100644
+--- a/Engine/Shaders/Private/MobileBasePassPixelShader.usf
++++ b/Engine/Shaders/Private/MobileBasePassPixelShader.usf
+@@ -299,6 +299,44 @@ void GetPrecomputedIndirectLightingAndSkyLight(VTPageTableResult LightmapVTPageT
+ #endif
+ }
+ 
++/**
++ * Screen-space shadow mask and AO are computed from resolved depth, so under MSAA they hold the nearest surface's value.
++ * A fragment of another surface at that pixel (an MSAA edge sample) uses the neighbouring texel whose resolved depth matches its own.
++ */
++float2 GetMSAAEdgeAwareBufferUV(float4 SvPosition, float2 BufferUV)
++{
++#if !MOBILE_MULTI_VIEW
++	BRANCH
++	if (MobileBasePass.bMSAAEdgeAwareFetch != 0)
++	{
++		const int2 Pixel = int2(SvPosition.xy);
++		const float FragmentDepth = ConvertFromDeviceZ(SvPosition.z);
++		const float Threshold = FragmentDepth * MobileBasePass.MSAAEdgeDepthThreshold;
++
++		float BestError = abs(ConvertFromDeviceZ(MobileBasePass.MSAAResolvedDepthTexture.Load(int3(Pixel, 0)).r) - FragmentDepth);
++		int2 BestOffset = int2(0, 0);
++
++		BRANCH
++		if (BestError > Threshold)
++		{
++			const int2 Offsets[4] = { int2(-1, 0), int2(1, 0), int2(0, -1), int2(0, 1) };
++			UNROLL
++			for (int Index = 0; Index < 4; ++Index)
++			{
++				const float Error = abs(ConvertFromDeviceZ(MobileBasePass.MSAAResolvedDepthTexture.Load(int3(Pixel + Offsets[Index], 0)).r) - FragmentDepth);
++				if (Error < BestError)
++				{
++					BestError = Error;
++					BestOffset = Offsets[Index];
++				}
++			}
++		}
++		return BufferUV + float2(BestOffset) * View.BufferSizeAndInvSize.zw;
++	}
++#endif
++	return BufferUV;
++}
++
+ PIXELSHADER_EARLYDEPTHSTENCIL
+ void Main( 
+ 	FVertexFactoryInterpolantsVSToPS Interpolants
+@@ -394,12 +432,18 @@ void Main(
+ #endif
+ 
+ 	float2 BufferUV = SvPositionToBufferUV(SvPosition);
+-	half4 ScreenSpaceShadowMaskSample = SampleScreenSpaceShadowMask(BufferUV, EyeIndex);
++	const float2 ScreenSpaceBufferUV = GetMSAAEdgeAwareBufferUV(SvPosition, BufferUV);
++	half4 ScreenSpaceShadowMaskSample = SampleScreenSpaceShadowMask(ScreenSpaceBufferUV, EyeIndex);
+ 
+ 	half MaterialAO = GetMaterialAmbientOcclusion(PixelMaterialInputs);
+ #if APPLY_AO
+ 	{
++	#if MOBILE_MULTI_VIEW
+ 		half GatheredAmbientOcclusion = ScreenSpaceShadowMaskSample.a;
++	#else
++		// Mobile SSAO renders into its own texture; nothing writes the shadow mask's alpha in forward
++		half GatheredAmbientOcclusion = Texture2DSampleLevel(MobileBasePass.AmbientOcclusionTexture, MobileBasePass.AmbientOcclusionSampler, ScreenSpaceBufferUV, 0).r;
++	#endif
+ 		#if ALLOW_STATIC_LIGHTING
+ 			GatheredAmbientOcclusion = lerp(1.0, GatheredAmbientOcclusion, MobileBasePass.AmbientOcclusionStaticFraction);
+ 		#endif
+diff --git a/Engine/Source/Runtime/Renderer/Private/MobileBasePassRendering.cpp b/Engine/Source/Runtime/Renderer/Private/MobileBasePassRendering.cpp
+index b02f20196703..a20f14c5ebee 100644
+--- a/Engine/Source/Runtime/Renderer/Private/MobileBasePassRendering.cpp
++++ b/Engine/Source/Runtime/Renderer/Private/MobileBasePassRendering.cpp
+@@ -88,6 +88,20 @@ static TAutoConsoleVariable<int32> CVarMobileEnableCapsuleDirectShadows(
+ 	ECVF_ReadOnly | ECVF_RenderThreadSafe);
+ 
+ 
++static TAutoConsoleVariable<int32> CVarMobileMSAAEdgeAwareFetch(
++	TEXT("r.Mobile.MSAA.EdgeAwareFetch"),
++	0,
++	TEXT("With MSAA, the forward base pass fetches the screen-space shadow mask and AO from the neighbouring texel whose resolved depth matches the fragment, so edge samples of a background surface stop taking the foreground's shadow and AO.\n")
++	TEXT("0: off (stock)\n")
++	TEXT("1: on"),
++	ECVF_RenderThreadSafe);
++
++static TAutoConsoleVariable<float> CVarMobileMSAAEdgeDepthThreshold(
++	TEXT("r.Mobile.MSAA.EdgeDepthThreshold"),
++	0.02f,
++	TEXT("Relative linear depth difference from the resolved depth above which a fragment counts as an MSAA edge sample of another surface."),
++	ECVF_RenderThreadSafe);
++
+ IMPLEMENT_STATIC_UNIFORM_BUFFER_STRUCT(FMobileBasePassUniformParameters, "MobileBasePass", SceneTextures);
+ 
+ static TAutoConsoleVariable<int32> CVarMobileUseHWsRGBEncoding(
+@@ -323,6 +337,17 @@ void SetupMobileBasePassUniformParameters(
+ 	}
+ 	BasePassParameters.ScreenSpaceShadowMaskSampler = TStaticSamplerState<SF_Point, AM_Clamp, AM_Clamp, AM_Clamp>::GetRHI();
+ 
++	// Resolved depth is a separate texture only under MSAA, and only exists once the full depth prepass has resolved it
++	const bool bMSAAEdgeAwareFetch = CVarMobileMSAAEdgeAwareFetch.GetValueOnRenderThread() != 0
++		&& !bIsRenderingDeferredBasepass
++		&& BasePass == EMobileBasePass::Opaque
++		&& SceneTextures
++		&& SceneTextures->Depth.IsSeparate()
++		&& HasBeenProduced(SceneTextures->Depth.Resolve);
++	BasePassParameters.MSAAResolvedDepthTexture = bMSAAEdgeAwareFetch ? SceneTextures->Depth.Resolve : SystemTextures.DepthDummy;
++	BasePassParameters.bMSAAEdgeAwareFetch = bMSAAEdgeAwareFetch ? 1 : 0;
++	BasePassParameters.MSAAEdgeDepthThreshold = FMath::Max(CVarMobileMSAAEdgeDepthThreshold.GetValueOnRenderThread(), 0.0f);
++
+ 	// Substrate
+ 	Substrate::BindSubstrateMobileForwardPasslUniformParameters(GraphBuilder, View, BasePassParameters.Substrate);
+ 
+diff --git a/Engine/Source/Runtime/Renderer/Private/MobileBasePassRendering.h b/Engine/Source/Runtime/Renderer/Private/MobileBasePassRendering.h
+index 9924ffbe3777..c556beeb2827 100644
+--- a/Engine/Source/Runtime/Renderer/Private/MobileBasePassRendering.h
++++ b/Engine/Source/Runtime/Renderer/Private/MobileBasePassRendering.h
+@@ -58,6 +58,9 @@ BEGIN_GLOBAL_SHADER_PARAMETER_STRUCT(FMobileBasePassUniformParameters, )
+ 	SHADER_PARAMETER_RDG_TEXTURE(Texture2D, ScreenSpaceShadowMaskTexture)
+ 	SHADER_PARAMETER_RDG_TEXTURE(Texture2DArray, ScreenSpaceShadowMaskTextureArray)
+ 	SHADER_PARAMETER_SAMPLER(SamplerState, ScreenSpaceShadowMaskSampler)
++	SHADER_PARAMETER_RDG_TEXTURE(Texture2D, MSAAResolvedDepthTexture)
++	SHADER_PARAMETER(uint32, bMSAAEdgeAwareFetch)
++	SHADER_PARAMETER(float, MSAAEdgeDepthThreshold)
+ 	SHADER_PARAMETER(uint32, bApplyHalfResLocalFogToSkyMeshes)
+ 	SHADER_PARAMETER_RDG_TEXTURE(Texture2D, HalfResLocalFogVolumeViewTexture)
+ 	SHADER_PARAMETER_SAMPLER(SamplerState, HalfResLocalFogVolumeViewSampler)
+diff --git a/Engine/Source/Runtime/Renderer/Private/PostProcess/PostProcessAmbientOcclusionMobile.cpp b/Engine/Source/Runtime/Renderer/Private/PostProcess/PostProcessAmbientOcclusionMobile.cpp
+index d59746029cce..15f5030f6a11 100644
+--- a/Engine/Source/Runtime/Renderer/Private/PostProcess/PostProcessAmbientOcclusionMobile.cpp
++++ b/Engine/Source/Runtime/Renderer/Private/PostProcess/PostProcessAmbientOcclusionMobile.cpp
+@@ -336,7 +336,9 @@ static FRDGTextureRef CreateMobileScreenSpaceAOTexture(FRDGBuilder& GraphBuilder
+ bool RequiresMobileAmbientOcclusionPass(FScene* Scene, const FViewInfo& View)
+ {
+ 	int32 CVarLevel = FSSAOHelper::GetNumAmbientOcclusionLevels();
+-	return CVarLevel > 0
++	// Scalability leaves the level at -1 (auto) on PC, which would otherwise keep mobile SSAO off even when the project enables it
++	const bool bLevelAllowsAO = CVarLevel > 0 || (CVarLevel < 0 && IsMobileAmbientOcclusionEnabled(View.GetShaderPlatform()));
++	return bLevelAllowsAO
+ 		&& View.FinalPostProcessSettings.AmbientOcclusionIntensity > 0
+ 		&& (View.FinalPostProcessSettings.AmbientOcclusionStaticFraction >= 1 / 100.0f || (Scene && Scene->SkyLight && View.Family->EngineShowFlags.SkyLighting))
+ 		&& View.Family->EngineShowFlags.Lighting

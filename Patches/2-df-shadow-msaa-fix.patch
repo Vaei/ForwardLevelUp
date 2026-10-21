@@ -1,0 +1,15 @@
+diff --git a/Engine/Source/Runtime/Renderer/Private/DistanceFieldShadowing.cpp b/Engine/Source/Runtime/Renderer/Private/DistanceFieldShadowing.cpp
+index de68201e4b41..01eca801f314 100644
+--- a/Engine/Source/Runtime/Renderer/Private/DistanceFieldShadowing.cpp
++++ b/Engine/Source/Runtime/Renderer/Private/DistanceFieldShadowing.cpp
+@@ -1143,7 +1143,9 @@ void FProjectedShadowInfo::RenderRayTracedDistanceFieldProjection(
+ 
+ 		FDistanceFieldShadowingUpsample* PassParameters = GraphBuilder.AllocParameters<FDistanceFieldShadowingUpsample>();
+ 		PassParameters->RenderTargets[0] = FRenderTargetBinding(ScreenShadowMaskTexture, GetLoadActionIfProduced(ScreenShadowMaskTexture, ERenderTargetLoadAction::EClear));
+-		PassParameters->RenderTargets.DepthStencil = FDepthStencilBinding(SceneTextures.Depth.Target, ERenderTargetLoadAction::ELoad, ERenderTargetLoadAction::ELoad, FExclusiveDepthStencil::DepthRead_StencilRead);
++		// The shadow mask is single-sample, so under MSAA bind the resolved depth to match its sample count
++		const bool bUseResolvedDepth = ScreenShadowMaskTexture->Desc.NumSamples == 1 && SceneTextures.Depth.IsSeparate() && HasBeenProduced(SceneTextures.Depth.Resolve);
++		PassParameters->RenderTargets.DepthStencil = FDepthStencilBinding(bUseResolvedDepth ? SceneTextures.Depth.Resolve : SceneTextures.Depth.Target, ERenderTargetLoadAction::ELoad, ERenderTargetLoadAction::ELoad, FExclusiveDepthStencil::DepthRead_StencilRead);
+ 		
+ 		PassParameters->PS.View = GetShaderBinding(View.ViewUniformBuffer);
+ 		PassParameters->PS.SceneTextures = SceneTextures.GetSceneTextureShaderParameters(View.GetFeatureLevel());

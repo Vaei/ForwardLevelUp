@@ -1,0 +1,291 @@
+diff --git a/Engine/Shaders/Private/DeferredShadingCommon.ush b/Engine/Shaders/Private/DeferredShadingCommon.ush
+index 7d1bb5cefbc8..1af707a11bee 100644
+--- a/Engine/Shaders/Private/DeferredShadingCommon.ush
++++ b/Engine/Shaders/Private/DeferredShadingCommon.ush
+@@ -931,6 +931,14 @@ FGBufferData MobileFetchAndDecodeGBuffer(in float2 UV, in float2 PixelPos, uint
+ 	GBuffer.Depth = SceneDepth;
+ #else
+ 	GBuffer.Depth = CalcSceneDepth(UV);
++	#if MOBILE_FORWARD_NORMAL_TARGET
++	// Written as (N * 0.5 + 0.5, 1) over a cleared zero vector; alpha 0 means nothing was drawn
++	const half4 EncodedNormal = Texture2DSampleLevel(MobileSceneTextures.GBufferATexture, MobileSceneTextures.GBufferATextureSampler, UV, 0);
++	if (EncodedNormal.a > 0)
++	{
++		GBuffer.WorldNormal = normalize(EncodedNormal.rgb * 2 - 1);
++	}
++	#endif
+ #endif
+ #if	MOBILE_MULTI_VIEW
+ 	GBuffer.CustomDepth = ConvertFromDeviceZ(MobileSceneTextures.CustomDepthTextureArray.Load(int4(PixelPos.xy, ViewId, 0)).r);
+diff --git a/Engine/Shaders/Private/MobileBasePassPixelShader.usf b/Engine/Shaders/Private/MobileBasePassPixelShader.usf
+index d28878493112..ce69a3217151 100644
+--- a/Engine/Shaders/Private/MobileBasePassPixelShader.usf
++++ b/Engine/Shaders/Private/MobileBasePassPixelShader.usf
+@@ -105,6 +105,13 @@
+ // Sky does not write to depth
+ #define HAS_SCENE_DEPTH_AUX_OUTPUT (USE_SCENE_DEPTH_AUX && (MATERIALBLENDING_SOLID || MATERIALBLENDING_MASKED) && !MATERIAL_SHADINGMODEL_SINGLELAYERWATER && !MATERIAL_IS_SKY)
+ 
++#define HAS_FORWARD_NORMAL_OUTPUT (MOBILE_FORWARD_NORMAL_TARGET && !MOBILE_USE_GBUFFER && (MATERIALBLENDING_SOLID || MATERIALBLENDING_MASKED) && !MATERIAL_SHADINGMODEL_SINGLELAYERWATER && !MATERIAL_IS_SKY)
++#if USE_SCENE_DEPTH_AUX
++	#define SV_TargetForwardNormal SV_Target2
++#else
++	#define SV_TargetForwardNormal SV_Target1
++#endif
++
+ #if MOBILE_USE_GBUFFER && MOBILE_EXTENDED_GBUFFER
+ 	#define SV_TargetDepthAux SV_Target5	
+ #elif MOBILE_USE_GBUFFER
+@@ -371,6 +378,9 @@ void Main(
+ #if HAS_SCENE_DEPTH_AUX_OUTPUT
+ 	, out float OutSceneDepthAux : SV_TargetDepthAux
+ #endif
++#if HAS_FORWARD_NORMAL_OUTPUT
++	, out HALF4_TYPE OutForwardNormal : SV_TargetForwardNormal
++#endif
+ #if OUTPUT_PIXEL_DEPTH_OFFSET
+ 	, out float OutDepth : SV_Depth
+ #endif
+@@ -1305,6 +1315,10 @@ void Main(
+ 	OutSceneDepthAux = SvPosition.z;
+ #endif
+ 
++#if HAS_FORWARD_NORMAL_OUTPUT
++	OutForwardNormal = HALF4_TYPE(normalize(MaterialParameters.WorldNormal) * 0.5 + 0.5, 1.0);
++#endif
++
+ #if !MATERIALBLENDING_MODULATE
+ #if MATERIAL_IS_SKY
+ 	// Dynamic capture exposure is 1 as of today.
+diff --git a/Engine/Source/Runtime/Engine/Private/Materials/HLSLMaterialTranslator.cpp b/Engine/Source/Runtime/Engine/Private/Materials/HLSLMaterialTranslator.cpp
+index 774b2d1a2221..a5d100c503ee 100644
+--- a/Engine/Source/Runtime/Engine/Private/Materials/HLSLMaterialTranslator.cpp
++++ b/Engine/Source/Runtime/Engine/Private/Materials/HLSLMaterialTranslator.cpp
+@@ -8313,10 +8313,15 @@ void FHLSLMaterialTranslator::UseSceneTextureId(ESceneTextureId SceneTextureId,
+ 
+ 	const bool bNeedsGBuffer = MaterialCompilationOutput.NeedsGBuffer();
+ 
+-	if (bNeedsGBuffer)
++	// The mobile forward normal target serves WorldNormal, and only after the base pass
++	const bool bMobileForwardNormalOnly = IsMobileForwardNormalTargetEnabled(Platform)
++		&& Material->GetMaterialDomain() == MD_PostProcess
++		&& (MaterialCompilationOutput.UsedSceneTextures & FMaterialCompilationOutput::GetGBufferMask()) == (1u << PPI_WorldNormal);
++
++	if (bNeedsGBuffer && !bMobileForwardNormalOnly)
+ 	{
+ 		const bool bMobilePlatform = IsMobilePlatform(Platform);
+-		
++
+ 		if ((bMobilePlatform && !IsMobileDeferredShadingEnabled(Platform)) || 
+ 			(!bMobilePlatform && IsForwardShadingEnabled(Platform)))
+ 		{
+diff --git a/Engine/Source/Runtime/Engine/Private/SceneTexturesConfig.cpp b/Engine/Source/Runtime/Engine/Private/SceneTexturesConfig.cpp
+index 7487ef13bb31..e781d2a1f043 100644
+--- a/Engine/Source/Runtime/Engine/Private/SceneTexturesConfig.cpp
++++ b/Engine/Source/Runtime/Engine/Private/SceneTexturesConfig.cpp
+@@ -410,6 +410,12 @@ uint32 FSceneTexturesConfig::GetGBufferRenderTargetsInfo(FGraphicsPipelineRender
+ 		RenderTargetsInfo.RenderTargetFormats[RenderTargetCount] = bPreciseDepthAux ? PF_R32_FLOAT : PF_R16F;
+ 		RenderTargetsInfo.RenderTargetFlags[RenderTargetCount++] = TexCreate_RenderTargetable | TexCreate_ShaderResource | TexCreate_InputAttachmentRead;
+ 	}
++
++	if (bRequiresMobileForwardNormal)
++	{
++		RenderTargetsInfo.RenderTargetFormats[RenderTargetCount] = PF_A2B10G10R10;
++		RenderTargetsInfo.RenderTargetFlags[RenderTargetCount++] = TexCreate_RenderTargetable | TexCreate_ShaderResource;
++	}
+ 	
+ 	if (bCustomResolveSubpass)
+ 	{
+diff --git a/Engine/Source/Runtime/Engine/Private/ShaderCompiler/ShaderCompiler.cpp b/Engine/Source/Runtime/Engine/Private/ShaderCompiler/ShaderCompiler.cpp
+index 05802660eaed..f69596d4ec28 100644
+--- a/Engine/Source/Runtime/Engine/Private/ShaderCompiler/ShaderCompiler.cpp
++++ b/Engine/Source/Runtime/Engine/Private/ShaderCompiler/ShaderCompiler.cpp
+@@ -3527,6 +3527,7 @@ void GlobalBeginCompileShader(
+ 			static const auto CVarEnableIESProfilesMobileForward = IConsoleManager::Get().FindTConsoleVariableDataInt(TEXT("r.Mobile.Forward.EnableIESProfiles"));
+ 			const int32 IESProfilesEnabled = CVarEnableIESProfilesMobileForward ? CVarEnableIESProfilesMobileForward->GetValueOnAnyThread() : 0;
+ 			SET_SHADER_DEFINE(Input.Environment, USE_IES_PROFILE, IESProfilesEnabled);
++			SET_SHADER_DEFINE(Input.Environment, MOBILE_FORWARD_NORMAL_TARGET, IsMobileForwardNormalTargetEnabled((EShaderPlatform)Target.Platform) ? 1 : 0);
+ 		}
+ 
+ 		SET_SHADER_DEFINE(Input.Environment, USE_SCENE_DEPTH_AUX, MobileRequiresSceneDepthAux(ShaderPlatform) ? 1 : 0);
+diff --git a/Engine/Source/Runtime/Engine/Public/SceneTexturesConfig.h b/Engine/Source/Runtime/Engine/Public/SceneTexturesConfig.h
+index 5c64a1701f34..d5f572a1f0c2 100644
+--- a/Engine/Source/Runtime/Engine/Public/SceneTexturesConfig.h
++++ b/Engine/Source/Runtime/Engine/Public/SceneTexturesConfig.h
+@@ -130,6 +130,7 @@ struct FSceneTexturesConfig
+ 		, bKeepDepthContent{ 1 }
+ 		, bRequiresDepthAux{}
+ 		, bPreciseDepthAux{}
++		, bRequiresMobileForwardNormal{}
+ 		, bCustomResolveSubpass{}
+ 		, bSamplesCustomStencil{}
+ 		, bMemorylessMSAA{}
+@@ -202,6 +203,9 @@ struct FSceneTexturesConfig
+ 	
+ 	// (Mobile) True if SceneDepthAux should use a precise pixel format
+ 	uint32 bPreciseDepthAux : 1;
++
++	// (Mobile) True if the forward base pass writes world normals to MobileForwardNormal
++	uint32 bRequiresMobileForwardNormal : 1;
+ 	
+ 	// (Mobile) True if Custom MSAA resolve subpass is enabled
+ 	uint32 bCustomResolveSubpass : 1;
+diff --git a/Engine/Source/Runtime/RenderCore/Private/RenderUtils.cpp b/Engine/Source/Runtime/RenderCore/Private/RenderUtils.cpp
+index 8dc0948ed3de..b1230e6e38a2 100644
+--- a/Engine/Source/Runtime/RenderCore/Private/RenderUtils.cpp
++++ b/Engine/Source/Runtime/RenderCore/Private/RenderUtils.cpp
+@@ -1740,6 +1740,12 @@ bool IsMobileDistanceFieldAOEnabled(const FStaticShaderPlatform Platform)
+ 	return MobileDistanceFieldAO.Get(Platform) > 0;
+ }
+ 
++bool IsMobileForwardNormalTargetEnabled(const FStaticShaderPlatform Platform)
++{
++	static FShaderPlatformCachedIniValue<bool> MobileForwardNormalTarget(TEXT("r.Mobile.Forward.NormalTarget"));
++	return IsMobilePlatform(Platform) && !IsMobileDeferredShadingEnabled(Platform) && MobileForwardNormalTarget.Get(Platform);
++}
++
+ bool IsStencilForLODDitherEnabled(const FStaticShaderPlatform Platform)
+ {
+ 	if (IsMobilePlatform(Platform) && !FReadOnlyCVARCache::MobileAllowDitheredLODTransition(Platform))
+diff --git a/Engine/Source/Runtime/RenderCore/Private/Shader.cpp b/Engine/Source/Runtime/RenderCore/Private/Shader.cpp
+index af715dae1089..c5c6de81c34a 100644
+--- a/Engine/Source/Runtime/RenderCore/Private/Shader.cpp
++++ b/Engine/Source/Runtime/RenderCore/Private/Shader.cpp
+@@ -2072,6 +2072,12 @@ void ShaderMapAppendKey(EShaderPlatform Platform, FShaderKeyGenerator& KeyGen)
+ 					KeyGen.AppendSeparator();
+ 					KeyGen.Append(TEXT("MobSSR"));
+ 				}
++
++				if (IsMobileForwardNormalTargetEnabled(Platform))
++				{
++					KeyGen.AppendSeparator();
++					KeyGen.Append(TEXT("MobFNT"));
++				}
+ 			}
+ 		}
+ 
+diff --git a/Engine/Source/Runtime/RenderCore/Public/RenderUtils.h b/Engine/Source/Runtime/RenderCore/Public/RenderUtils.h
+index b62d2ee66408..8c0286a82413 100644
+--- a/Engine/Source/Runtime/RenderCore/Public/RenderUtils.h
++++ b/Engine/Source/Runtime/RenderCore/Public/RenderUtils.h
+@@ -368,6 +368,9 @@ RENDERCORE_API bool IsWaterSeparateMainDirLightEnabled(const FStaticShaderPlatfo
+ /** Returns if Mobile Distance Field AO Enabled. */
+ RENDERCORE_API bool IsMobileDistanceFieldAOEnabled(const FStaticShaderPlatform Platform);
+ 
++/** Returns if the mobile forward base pass writes world normals to a render target for post-process materials. */
++RENDERCORE_API bool IsMobileForwardNormalTargetEnabled(const FStaticShaderPlatform Platform);
++
+ /** Returns if Stencil For LOD Dither is Enabled for this ShaderPlatform. */
+ RENDERCORE_API bool IsStencilForLODDitherEnabled(const FStaticShaderPlatform Platform);
+ 
+diff --git a/Engine/Source/Runtime/Renderer/Internal/SceneTextures.h b/Engine/Source/Runtime/Renderer/Internal/SceneTextures.h
+index b160c4eab3f4..fe99355eaabc 100644
+--- a/Engine/Source/Runtime/Renderer/Internal/SceneTextures.h
++++ b/Engine/Source/Runtime/Renderer/Internal/SceneTextures.h
+@@ -144,6 +144,9 @@ struct FSceneTextures : public FMinimalSceneTextures
+ 	// Additional Buffer texture used by mobile
+ 	FRDGTextureMSAA DepthAux{};
+ 
++	// (Mobile forward) World normals from the base pass, encoded as N * 0.5 + 0.5 with coverage in alpha.
++	FRDGTextureMSAA MobileForwardNormal{};
++
+ 	// Texture containing dynamic motion vectors. Can be bound by the base pass or its own velocity pass.
+ 	FRDGTextureRef Velocity{};
+ 
+diff --git a/Engine/Source/Runtime/Renderer/Private/MobileBasePassRendering.cpp b/Engine/Source/Runtime/Renderer/Private/MobileBasePassRendering.cpp
+index a20f14c5ebee..3837697000cb 100644
+--- a/Engine/Source/Runtime/Renderer/Private/MobileBasePassRendering.cpp
++++ b/Engine/Source/Runtime/Renderer/Private/MobileBasePassRendering.cpp
+@@ -51,6 +51,14 @@ static TAutoConsoleVariable<int32> CVarMobileEnableMovablePointLightShadows(
+ 	TEXT("If 1 then enable movable point light shadow support"),
+ 	ECVF_ReadOnly | ECVF_RenderThreadSafe);
+ 
++static TAutoConsoleVariable<int32> CVarMobileForwardNormalTarget(
++	TEXT("r.Mobile.Forward.NormalTarget"),
++	0,
++	TEXT("Whether the mobile forward base pass writes world normals to a render target, so post-process materials can read SceneTexture WorldNormal.\n")
++	TEXT("0: off (stock)\n")
++	TEXT("1: on, one extra MSAA render target"),
++	ECVF_ReadOnly | ECVF_RenderThreadSafe);
++
+ static TAutoConsoleVariable<int32> CVarMobileSceneDepthAux(
+ 	TEXT("r.Mobile.SceneDepthAux"),
+ 	1,
+diff --git a/Engine/Source/Runtime/Renderer/Private/MobileShadingRenderer.cpp b/Engine/Source/Runtime/Renderer/Private/MobileShadingRenderer.cpp
+index 8c5b3d3cde5e..5f264ddb4f20 100644
+--- a/Engine/Source/Runtime/Renderer/Private/MobileShadingRenderer.cpp
++++ b/Engine/Source/Runtime/Renderer/Private/MobileShadingRenderer.cpp
+@@ -762,6 +762,8 @@ void FMobileSceneRenderer::InitViews(
+ 	}
+ 
+ 	SceneTexturesConfig.bRequiresDepthAux = bRequiresSceneDepthAux;
++	// The tonemap subpass puts the backbuffer in the slot after scene color and has no post-processing to read normals
++	SceneTexturesConfig.bRequiresMobileForwardNormal = !bDeferredShading && !bTonemapSubpass && IsMobileForwardNormalTargetEnabled(ShaderPlatform);
+ 	// When we capturing scene depth, use a more precise format for SceneDepthAux as it will be used as a source DepthTexture
+ 	if (bSceneDepthCapture)
+ 	{
+@@ -2086,6 +2088,10 @@ FRenderTargetBindingSlots FMobileSceneRenderer::InitRenderTargetBindings_Forward
+ 	{
+ 		BasePassRenderTargets[1] = FRenderTargetBinding(SceneTextures.DepthAux.Target, SceneTextures.DepthAux.Resolve, ERenderTargetLoadAction::EClear);
+ 	}
++	if (SceneTextures.Config.bRequiresMobileForwardNormal)
++	{
++		BasePassRenderTargets[(bRequiresSceneDepthAux ? 2 : 1)] = FRenderTargetBinding(SceneTextures.MobileForwardNormal.Target, SceneTextures.MobileForwardNormal.Resolve, ERenderTargetLoadAction::EClear);
++	}
+ 		
+ 	if (bTonemapSubpassInline)
+ 	{
+@@ -2426,6 +2432,10 @@ void FMobileSceneRenderer::RenderForwardMultiPass(FRDGBuilder& GraphBuilder, FMo
+ 	SecondPassParameters->ReflectionCapture = View.MobileReflectionCaptureUniformBuffer;
+ 	SecondPassParameters->RenderTargets[0].SetLoadAction(ERenderTargetLoadAction::ELoad);
+ 	SecondPassParameters->RenderTargets[1] = FRenderTargetBinding();
++	if (SceneTextures.Config.bRequiresMobileForwardNormal)
++	{
++		SecondPassParameters->RenderTargets[(bRequiresSceneDepthAux ? 2 : 1)] = FRenderTargetBinding();
++	}
+ 	// AddResolveSceneColorPass below rewrites Color.Resolve from the MSAA target whenever the target is separate and not memoryless.
+ 	// The first pass keeps its hardware resolve because scene color copies (water, distortion) read it between the passes.
+ 	// Mobile SSR traces last frame's resolved color, which crashes in D3D11 without this resolve.
+diff --git a/Engine/Source/Runtime/Renderer/Private/SceneTextures.cpp b/Engine/Source/Runtime/Renderer/Private/SceneTextures.cpp
+index 3c086d964169..ac13682570c1 100644
+--- a/Engine/Source/Runtime/Renderer/Private/SceneTextures.cpp
++++ b/Engine/Source/Runtime/Renderer/Private/SceneTextures.cpp
+@@ -791,6 +791,15 @@ void FSceneTextures::InitializeViewFamily(FRDGBuilder& GraphBuilder, FViewFamily
+ 		SceneTextures.DepthAux = CreateTextureMSAA(GraphBuilder, Desc, TEXT("SceneDepthAuxMS"), TEXT("SceneDepthAux"));
+ 	}
+ 
++	if (Config.bRequiresMobileForwardNormal)
++	{
++		const ETextureCreateFlags MemorylessFlag = (Config.NumSamples > 1 && Config.bMemorylessMSAA) ? TexCreate_Memoryless : TexCreate_None;
++		// Cleared to a zero vector so MSAA resolves of edge pixels average to a scaled normal
++		FRDGTextureDesc Desc = FRDGTextureDesc::CreateRenderTargetTextureDesc(Config.Extent, PF_A2B10G10R10, FClearValueBinding(FLinearColor(0.5f, 0.5f, 0.5f, 0.0f)), TexCreate_RenderTargetable | TexCreate_ShaderResource | MemorylessFlag, Config.bRequireMultiView, Config.MobileMultiViewRenderTargetNumLayers);
++		Desc.NumSamples = Config.NumSamples;
++		SceneTextures.MobileForwardNormal = CreateTextureMSAA(GraphBuilder, Desc, TEXT("MobileForwardNormalMS"), TEXT("MobileForwardNormal"));
++	}
++
+ 	if (ViewFamily.EngineShowFlags.StereoMotionVectors && PlatformSupportsOpenXRMotionVectors(ViewFamily.GetShaderPlatform()))
+ 	{
+ 		FTextureRHIRef StereoMotionVectorRHI, StereoMotionVectorDepthRHI;
+@@ -978,6 +987,7 @@ TArray<FRDGTextureRef> FSceneTextures::EnumerateSceneTextures() const
+ 	AddTextureIfNonNull(DitheredHalfResDepth, Results);
+ 	AddTextureIfNonNull(GBufferSGGX, Results);
+ 	AddTextureIfNonNull(DepthAux, Results);
++	AddTextureIfNonNull(MobileForwardNormal, Results);
+ 	AddTextureIfNonNull(Velocity, Results);
+ 	AddTextureIfNonNull(ScreenSpaceAO, Results);
+ 	AddTextureIfNonNull(DebugAux, Results);
+@@ -1314,6 +1324,15 @@ void SetupMobileSceneTextureUniformParameters(
+ 			}
+ 		}
+ 
++		// Forward has no GBuffer; its normal target takes GBufferA's slot
++		if (!SceneTextures->Config.bIsUsingGBuffers
++			&& EnumHasAnyFlags(SetupMode, EMobileSceneTextureSetupMode::GBufferA)
++			&& HasBeenProduced(SceneTextures->MobileForwardNormal.Resolve)
++			&& !EnumHasAnyFlags(SceneTextures->MobileForwardNormal.Resolve->Desc.Flags, TexCreate_Memoryless))
++		{
++			SceneTextureParameters.GBufferATexture = SceneTextures->MobileForwardNormal.Resolve;
++		}
++
+ 		if (EnumHasAnyFlags(SetupMode, EMobileSceneTextureSetupMode::SceneDepthAux))
+ 		{
+ 			if (HasBeenProduced(SceneTextures->DepthAux.Resolve) &&

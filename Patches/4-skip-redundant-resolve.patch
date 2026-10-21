@@ -1,0 +1,36 @@
+diff --git a/Engine/Source/Runtime/Renderer/Private/MobileShadingRenderer.cpp b/Engine/Source/Runtime/Renderer/Private/MobileShadingRenderer.cpp
+index 1faca57de91e..11f4009391bd 100644
+--- a/Engine/Source/Runtime/Renderer/Private/MobileShadingRenderer.cpp
++++ b/Engine/Source/Runtime/Renderer/Private/MobileShadingRenderer.cpp
+@@ -167,6 +167,14 @@ static TAutoConsoleVariable<int32> CVarMobileCustomDepthForTranslucency(
+ 	TEXT(" 1 = On [default]"),
+ 	ECVF_Scalability | ECVF_RenderThreadSafe);
+ 
++static TAutoConsoleVariable<int32> CVarMobileMSAASkipRedundantResolve(
++	TEXT("r.Mobile.MSAA.SkipRedundantResolve"),
++	0,
++	TEXT("Whether the forward decals and translucency pass skips its hardware MSAA color resolve when the custom resolve pass overwrites it straight after.\n")
++	TEXT("0: off (stock)\n")
++	TEXT("1: on"),
++	ECVF_RenderThreadSafe);
++
+ static TAutoConsoleVariable<int32> CVarMobileXRMSAAMode(
+ 	TEXT("r.Mobile.XRMSAAMode"),
+ 	0,
+@@ -2414,6 +2422,16 @@ void FMobileSceneRenderer::RenderForwardMultiPass(FRDGBuilder& GraphBuilder, FMo
+ 	SecondPassParameters->ReflectionCapture = View.MobileReflectionCaptureUniformBuffer;
+ 	SecondPassParameters->RenderTargets[0].SetLoadAction(ERenderTargetLoadAction::ELoad);
+ 	SecondPassParameters->RenderTargets[1] = FRenderTargetBinding();
++	// AddResolveSceneColorPass below rewrites Color.Resolve from the MSAA target whenever the target is separate and not memoryless.
++	// The first pass keeps its hardware resolve because scene color copies (water, distortion) read it between the passes.
++	if (CVarMobileMSAASkipRedundantResolve.GetValueOnRenderThread() != 0
++		&& SceneTextures.Color.IsSeparate()
++		&& SceneTextures.Color.Target->Desc.NumSamples > 1
++		&& !EnumHasAnyFlags(SceneTextures.Color.Target->Desc.Flags, TexCreate_Memoryless)
++		&& SecondPassParameters->RenderTargets[0].GetResolveTexture() == SceneTextures.Color.Resolve)
++	{
++		SecondPassParameters->RenderTargets[0].SetResolveTexture(nullptr);
++	}
+ 	SecondPassParameters->RenderTargets.DepthStencil.SetDepthLoadAction(ERenderTargetLoadAction::ELoad);
+ 	SecondPassParameters->RenderTargets.DepthStencil.SetStencilLoadAction(ERenderTargetLoadAction::ELoad);
+ 	SecondPassParameters->RenderTargets.DepthStencil.SetDepthStencilAccess(ExclusiveDepthStencil);
