@@ -3,7 +3,7 @@
 Clean MSAA and proper ambient occlusion for Unreal Engine 5.8's mobile forward renderer, on PC and mobile hardware. Engine patches for a source build; everything is off until you turn it on.
 
 > [!IMPORTANT]
-> Level up to a modern forward rendering solution with clean MSAA, ambient occlusion, bounce lighting and deferred-style decals.
+> Level up Unreal Engine's Mobile Forward Rendering Path to Modern Standards: MSAA, SSAO, DFAO, SSR without TAA, analytic capsule AO.
 
 ## Comparisons & Gameplay Videos
 
