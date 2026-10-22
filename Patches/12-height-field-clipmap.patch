@@ -1,0 +1,147 @@
+diff --git a/Engine/Shaders/Private/MobileHeightFieldAO.usf b/Engine/Shaders/Private/MobileHeightFieldAO.usf
+index 789d361f4780..39910c86198d 100644
+--- a/Engine/Shaders/Private/MobileHeightFieldAO.usf
++++ b/Engine/Shaders/Private/MobileHeightFieldAO.usf
+@@ -6,7 +6,7 @@
+ Texture2D HeightTexture;
+ SamplerState HeightSampler;
+ float4 HeightUVScaleBias;
+-float2 HeightWorldSize;
++float4 HeightValidBounds;
+ float HeightTop;
+ float MaxDistance;
+ float MinDistance;
+@@ -38,8 +38,7 @@ void MainPS(float4 SvPosition : SV_POSITION, out float4 OutColor : SV_Target0)
+ 	const float3 Normal = ReconstructNormal(Pixel, Position);
+ 	const float3 Origin = Position + Normal * NormalBias;
+ 
+-	const float2 UV = GetHeightUV(Origin.xy);
+-	const float2 EdgeDistance = min(UV, 1 - UV) * HeightWorldSize;
++	const float2 EdgeDistance = min(Origin.xy - HeightValidBounds.xy, HeightValidBounds.zw - Origin.xy);
+ 	const float EdgeFade = saturate(min(EdgeDistance.x, EdgeDistance.y) / MaxDistance);
+ 
+ 	float Visibility = 1;
+diff --git a/Engine/Source/Runtime/Renderer/Private/MobileHeightFieldAO.cpp b/Engine/Source/Runtime/Renderer/Private/MobileHeightFieldAO.cpp
+index 0f13863b1f2b..b676b4b1f67e 100644
+--- a/Engine/Source/Runtime/Renderer/Private/MobileHeightFieldAO.cpp
++++ b/Engine/Source/Runtime/Renderer/Private/MobileHeightFieldAO.cpp
+@@ -65,6 +65,10 @@ public:
+ 
+ 	TRefCountPtr<IPooledRenderTarget> HeightTexture;
+ 	FBox WorldBounds = FBox(ForceInit);
++
++	/** Toroidal addressing: WrapSize along each axis, sampled only inside ValidBounds. Zero when the texture covers WorldBounds once. */
++	double WrapSize = 0.0;
++	FBox2D ValidBounds = FBox2D(ForceInit);
+ };
+ 
+ IMPLEMENT_SCENE_EXTENSION(FMobileHeightFieldAOSceneExtension);
+@@ -80,13 +84,42 @@ void SetMobileHeightFieldAO(FSceneInterface* SceneInterface, UTexture* HeightTex
+ 	}
+ 
+ 	FTextureResource* Resource = HeightTexture ? HeightTexture->GetResource() : nullptr;
+-	ENQUEUE_RENDER_COMMAND(SetMobileHeightFieldAO)([Scene, Resource, WorldBounds](FRHICommandListImmediate&)
++	const FBox2D ValidBounds = WorldBounds.IsValid ? FBox2D(FVector2D(WorldBounds.Min), FVector2D(WorldBounds.Max)) : FBox2D(ForceInit);
++	ENQUEUE_RENDER_COMMAND(SetMobileHeightFieldAO)([Scene, Resource, WorldBounds, ValidBounds](FRHICommandListImmediate&)
+ 	{
+ 		if (FMobileHeightFieldAOSceneExtension* Extension = Scene->GetExtensionPtr<FMobileHeightFieldAOSceneExtension>())
+ 		{
+ 			FRHITexture* Texture = Resource ? Resource->GetTextureRHI() : nullptr;
+ 			Extension->HeightTexture = Texture ? CreateRenderTarget(Texture, TEXT("MobileHeightFieldAO")) : nullptr;
+ 			Extension->WorldBounds = WorldBounds;
++			Extension->WrapSize = 0.0;
++			Extension->ValidBounds = ValidBounds;
++		}
++	});
++}
++
++void SetMobileHeightFieldAOWrapped(FSceneInterface* SceneInterface, UTexture* HeightTexture, double WorldSize, double Top, const FBox2D& ValidBounds)
++{
++	TRACE_CPUPROFILER_EVENT_SCOPE(MobileHeightFieldAO::SetMobileHeightFieldAOWrapped);
++
++	FScene* Scene = SceneInterface ? SceneInterface->GetRenderScene() : nullptr;
++	if (!Scene)
++	{
++		return;
++	}
++
++	FTextureResource* Resource = HeightTexture ? HeightTexture->GetResource() : nullptr;
++	// Only Max.Z (the top) and the bounds' validity are read in wrapped mode
++	const FBox WorldBounds(FVector(ValidBounds.Min, Top - 1.0), FVector(ValidBounds.Max, Top));
++	ENQUEUE_RENDER_COMMAND(SetMobileHeightFieldAOWrapped)([Scene, Resource, WorldBounds, WorldSize, ValidBounds](FRHICommandListImmediate&)
++	{
++		if (FMobileHeightFieldAOSceneExtension* Extension = Scene->GetExtensionPtr<FMobileHeightFieldAOSceneExtension>())
++		{
++			FRHITexture* Texture = Resource ? Resource->GetTextureRHI() : nullptr;
++			Extension->HeightTexture = Texture && ValidBounds.bIsValid ? CreateRenderTarget(Texture, TEXT("MobileHeightFieldAO")) : nullptr;
++			Extension->WorldBounds = WorldBounds;
++			Extension->WrapSize = FMath::Max(WorldSize, 1.0);
++			Extension->ValidBounds = ValidBounds;
+ 		}
+ 	});
+ }
+@@ -103,7 +136,7 @@ public:
+ 		SHADER_PARAMETER_RDG_TEXTURE(Texture2D, HeightTexture)
+ 		SHADER_PARAMETER_SAMPLER(SamplerState, HeightSampler)
+ 		SHADER_PARAMETER(FVector4f, HeightUVScaleBias)
+-		SHADER_PARAMETER(FVector2f, HeightWorldSize)
++		SHADER_PARAMETER(FVector4f, HeightValidBounds)
+ 		SHADER_PARAMETER(float, HeightTop)
+ 		SHADER_PARAMETER(float, MaxDistance)
+ 		SHADER_PARAMETER(float, MinDistance)
+@@ -137,6 +170,7 @@ void RenderMobileHeightFieldAO(FRDGBuilder& GraphBuilder, FScene* Scene, TArrayV
+ 
+ 	FRDGTextureRef HeightTexture = GraphBuilder.RegisterExternalTexture(Extension->HeightTexture);
+ 	const FVector WorldSize = Extension->WorldBounds.GetSize();
++	const bool bWrapped = Extension->WrapSize > 0.0;
+ 	const float MaxDistance = FMath::Max(CVarMobileHeightFieldAOMaxDistance.GetValueOnRenderThread(), 1.0f);
+ 
+ 	for (const FViewInfo& View : Views)
+@@ -154,11 +188,26 @@ void RenderMobileHeightFieldAO(FRDGBuilder& GraphBuilder, FScene* Scene, TArrayV
+ 		PassParameters->View = View.ViewUniformBuffer;
+ 		PassParameters->SceneDepthTexture = SceneDepth;
+ 		PassParameters->HeightTexture = HeightTexture;
+-		PassParameters->HeightSampler = TStaticSamplerState<SF_Bilinear, AM_Clamp, AM_Clamp, AM_Clamp>::GetRHI();
+-		PassParameters->HeightUVScaleBias = FVector4f(
+-			1.0f / WorldSize.Y, -1.0f / WorldSize.X,
+-			-TranslatedMin.Y / WorldSize.Y, TranslatedMax.X / WorldSize.X);
+-		PassParameters->HeightWorldSize = FVector2f(WorldSize.Y, WorldSize.X);
++		if (bWrapped)
++		{
++			// The bias is reduced in double precision so large world coordinates keep their texel accuracy
++			const FVector PreViewTranslation = View.ViewMatrices.GetPreViewTranslation();
++			const double Size = Extension->WrapSize;
++			PassParameters->HeightSampler = TStaticSamplerState<SF_Bilinear, AM_Wrap, AM_Wrap, AM_Clamp>::GetRHI();
++			PassParameters->HeightUVScaleBias = FVector4f(
++				(float)(1.0 / Size), (float)(-1.0 / Size),
++				(float)FMath::Frac(-PreViewTranslation.Y / Size), (float)FMath::Frac(PreViewTranslation.X / Size));
++		}
++		else
++		{
++			PassParameters->HeightSampler = TStaticSamplerState<SF_Bilinear, AM_Clamp, AM_Clamp, AM_Clamp>::GetRHI();
++			PassParameters->HeightUVScaleBias = FVector4f(
++				1.0f / WorldSize.Y, -1.0f / WorldSize.X,
++				-TranslatedMin.Y / WorldSize.Y, TranslatedMax.X / WorldSize.X);
++		}
++		const FVector2D PreViewTranslationXY(View.ViewMatrices.GetPreViewTranslation());
++		const FBox2D TranslatedValid = Extension->ValidBounds.ShiftBy(PreViewTranslationXY);
++		PassParameters->HeightValidBounds = FVector4f((float)TranslatedValid.Min.X, (float)TranslatedValid.Min.Y, (float)TranslatedValid.Max.X, (float)TranslatedValid.Max.Y);
+ 		PassParameters->HeightTop = TranslatedMax.Z;
+ 		PassParameters->MaxDistance = MaxDistance;
+ 		PassParameters->MinDistance = FMath::Clamp(CVarMobileHeightFieldAOMinDistance.GetValueOnRenderThread(), 0.0f, MaxDistance);
+diff --git a/Engine/Source/Runtime/Renderer/Public/MobileHeightFieldAO.h b/Engine/Source/Runtime/Renderer/Public/MobileHeightFieldAO.h
+index e3b806cc2d91..5c1b0cd099a2 100644
+--- a/Engine/Source/Runtime/Renderer/Public/MobileHeightFieldAO.h
++++ b/Engine/Source/Runtime/Renderer/Public/MobileHeightFieldAO.h
+@@ -14,3 +14,11 @@ class UTexture;
+  * The texture must stay alive until it is cleared.
+  */
+ RENDERER_API void SetMobileHeightFieldAO(FSceneInterface* Scene, UTexture* HeightTexture, const FBox& WorldBounds);
++
++/**
++ * Sets a toroidal height texture instead: it covers WorldSize along each axis and is addressed by world position modulo WorldSize,
++ * so a window that follows the camera only has to capture the tiles it moves onto, into the texels that wrap around.
++ * A holds the distance below Top, with the same orientation as above. Only ValidBounds (world XY) is sampled; occlusion fades
++ * out towards its edges. Clear it with SetMobileHeightFieldAO(Scene, nullptr, FBox(ForceInit)).
++ */
++RENDERER_API void SetMobileHeightFieldAOWrapped(FSceneInterface* Scene, UTexture* HeightTexture, double WorldSize, double Top, const FBox2D& ValidBounds);

@@ -1,0 +1,907 @@
+diff --git a/Engine/Shaders/Private/MobileBasePassPixelShader.usf b/Engine/Shaders/Private/MobileBasePassPixelShader.usf
+index 5d9e519971e3..0df5f83719be 100644
+--- a/Engine/Shaders/Private/MobileBasePassPixelShader.usf
++++ b/Engine/Shaders/Private/MobileBasePassPixelShader.usf
+@@ -126,6 +126,9 @@
+ #include "SHCommon.ush"
+ #include "/Engine/Generated/Material.ush"
+ #include "MobileBasePassCommon.ush"
++#if MOBILE_CLUSTERED_DECALS
++#include "MobileClusteredDecals.ush"
++#endif
+ #include "/Engine/Generated/VertexFactory.ush"
+ #include "LightmapCommon.ush"  
+ #define ENABLE_NDOTL_INTEGRATION 1
+@@ -568,6 +571,19 @@ void Main(
+ 	}
+ #endif
+ 
++#if MOBILE_CLUSTERED_DECALS && MATERIALDECALRESPONSEMASK && !MATERIALBLENDING_ANY_TRANSLUCENT && !MATERIAL_SHADINGMODEL_SINGLELAYERWATER && !TEMPLATE_USES_SUBSTRATE
++	BRANCH
++	if ((GetPrimitiveData(MaterialParameters).Flags & PRIMITIVE_SCENE_DATA_FLAG_DECAL_RECEIVER) != 0 && View.ShowDecalsMask > 0 && MobileBasePass.NumClusteredDecals > 0)
++	{
++		FDBufferData ClusteredDecalData;
++		if (GetMobileClusteredDecalData(SvPosition.xy, MaterialParameters.WorldPosition_CamRelative, MATERIALDECALRESPONSEMASK, ClusteredDecalData))
++		{
++			ApplyDBufferData(ClusteredDecalData, MaterialParameters.WorldNormal, SubsurfaceColor, Roughness, BaseColor, Metallic, Specular);
++			MaterialParameters.ReflectionVector = ReflectionAboutCustomWorldNormal(MaterialParameters, MaterialParameters.WorldNormal, false);
++		}
++	}
++#endif
++
+ 
+ #if !TEMPLATE_USES_SUBSTRATE || SUBSTRATE_INLINE_SINGLELAYERWATER
+ 	const half BaseMaterialCoverageOverWater = Opacity;
+diff --git a/Engine/Shaders/Private/MobileClusteredDecalBake.usf b/Engine/Shaders/Private/MobileClusteredDecalBake.usf
+new file mode 100644
+index 000000000000..2118c213df68
+--- /dev/null
++++ b/Engine/Shaders/Private/MobileClusteredDecalBake.usf
+@@ -0,0 +1,60 @@
++// Copyright (c) 2026 Jared Taylor.
++
++#include "Common.ush"
++
++#define MobileSceneTextures DecalPass.MobileSceneTextures
++#define EyeAdaptationStruct DecalPass
++#define SubstrateStruct DecalPass.SubstratePublic
++
++// Read by the material template for decals, as DeferredDecal.usf declares them
++float4 DecalPositionHigh;
++float4x4 DecalToWorld;
++float3 DecalToWorldInvScale;
++float3 DecalOrientation;
++float2 DecalParams;
++float4 DecalColorParam;
++
++/** xy: the tile's first pixel in the atlas, zw: one over its size. */
++float4 BakeTileRect;
++float4x4 BakeDecalToTranslatedWorld;
++
++#define DECAL_PRIMITIVE 1
++#include "/Engine/Generated/Material.ush"
++
++/** The material across the decal's plane, through its centre: UVs as the decal pass gives them, with no fading along the projection. */
++void MainPS(
++	float4 SvPosition : SV_POSITION,
++	out float4 OutBaseColor : SV_Target0,
++	out float4 OutNormal : SV_Target1,
++	out float4 OutRoughness : SV_Target2)
++{
++	const float2 DecalUVs = (SvPosition.xy - BakeTileRect.xy) * BakeTileRect.zw;
++	const float3 OSPosition = float3(0, DecalUVs.y * 2 - 1, DecalUVs.x * 2 - 1);
++	const float3 TranslatedWorldPosition = mul(float4(OSPosition, 1), BakeDecalToTranslatedWorld).xyz;
++
++	FMaterialPixelParameters MaterialParameters = MakeInitializedMaterialPixelParameters();
++#if NUM_MATERIAL_TEXCOORDS
++	for (int CoordinateIndex = 0; CoordinateIndex < NUM_MATERIAL_TEXCOORDS; CoordinateIndex++)
++	{
++		MaterialParameters.TexCoords[CoordinateIndex] = DecalUVs;
++	}
++#endif
++	MaterialParameters.TwoSidedSign = 1;
++	MaterialParameters.VertexColor = 1;
++	// Looking down the projection, as a receiver facing the decal would
++	MaterialParameters.CameraVector = -normalize(DecalOrientation);
++	MaterialParameters.SvPosition = float4(SvPosition.xy, 0.5, 1);
++	MaterialParameters.ScreenPosition = SvPositionToResolvedScreenPosition(MaterialParameters.SvPosition);
++	MaterialParameters.LightVector = float3(DecalUVs, 0.5);
++	MaterialParameters.AbsoluteWorldPosition = MaterialParameters.WorldPosition_NoOffsets = DFFastSubtract(TranslatedWorldPosition, PrimaryView.PreViewTranslation);
++	MaterialParameters.WorldPosition_CamRelative = MaterialParameters.WorldPosition_NoOffsets_CamRelative = TranslatedWorldPosition;
++	MaterialParameters.LWCData = MakeMaterialLWCData(MaterialParameters);
++
++	FPixelMaterialInputs PixelMaterialInputs;
++	CalcPixelMaterialInputs(MaterialParameters, PixelMaterialInputs);
++
++	const float Opacity = saturate(GetMaterialOpacity(PixelMaterialInputs));
++	OutBaseColor = float4(saturate(GetMaterialBaseColor(PixelMaterialInputs)), Opacity);
++	OutNormal = float4(normalize(MaterialParameters.WorldNormal) * 0.5 + 0.5, Opacity);
++	OutRoughness = float4(saturate(GetMaterialMetallic(PixelMaterialInputs)), saturate(GetMaterialSpecular(PixelMaterialInputs)), saturate(GetMaterialRoughness(PixelMaterialInputs)), Opacity);
++}
+diff --git a/Engine/Shaders/Private/MobileClusteredDecals.ush b/Engine/Shaders/Private/MobileClusteredDecals.ush
+new file mode 100644
+index 000000000000..56afb1f31e6a
+--- /dev/null
++++ b/Engine/Shaders/Private/MobileClusteredDecals.ush
+@@ -0,0 +1,83 @@
++// Copyright (c) 2026 Jared Taylor.
++
++#pragma once
++
++#include "DBufferDecalShared.ush"
++
++/**
++ * Composites the decals listed for this pixel's screen tile, in sort order, the way the DBuffer passes would have blended them,
++ * so the result applies with ApplyDBufferData. Returns false when no decal covers the pixel.
++ */
++bool GetMobileClusteredDecalData(float2 SvPositionXY, float3 TranslatedWorldPosition, uint ResponseMask, out FDBufferData OutData)
++{
++	OutData.PreMulColor = 0;
++	OutData.ColorOpacity = 1;
++	OutData.PreMulWorldNormal = 0;
++	OutData.NormalOpacity = 1;
++	OutData.PreMulRoughness = 0;
++	OutData.PreMulMetallic = 0;
++	OutData.PreMulSpecular = 0;
++	OutData.RoughnessOpacity = 1;
++
++	const uint2 Tile = uint2(SvPositionXY - ResolvedView.ViewRectMin.xy) >> MobileBasePass.ClusteredDecalTileShift;
++	if (any(Tile >= uint2(MobileBasePass.ClusteredDecalTileCount)))
++	{
++		return false;
++	}
++
++	const uint TileOffset = (Tile.y * MobileBasePass.ClusteredDecalTileCount.x + Tile.x) * MobileBasePass.ClusteredDecalTileStride;
++	const uint NumDecals = MobileBasePass.ClusteredDecalTiles[TileOffset];
++	bool bAnyDecal = false;
++
++	LOOP
++	for (uint ListIndex = 0; ListIndex < NumDecals; ListIndex++)
++	{
++		const uint DecalOffset = MobileBasePass.ClusteredDecalTiles[TileOffset + 1 + ListIndex] * 5;
++		const float4 TranslatedPosition = float4(TranslatedWorldPosition, 1);
++		const float3 DecalPosition = float3(
++			dot(TranslatedPosition, MobileBasePass.ClusteredDecalData[DecalOffset + 0]),
++			dot(TranslatedPosition, MobileBasePass.ClusteredDecalData[DecalOffset + 1]),
++			dot(TranslatedPosition, MobileBasePass.ClusteredDecalData[DecalOffset + 2]));
++		if (any(abs(DecalPosition) > 1))
++		{
++			continue;
++		}
++
++		const float4 AtlasScaleBias = MobileBasePass.ClusteredDecalData[DecalOffset + 3];
++		const float4 Params = MobileBasePass.ClusteredDecalData[DecalOffset + 4];
++		const float2 AtlasUV = (DecalPosition.zy * 0.5 + 0.5) * AtlasScaleBias.xy + AtlasScaleBias.zw;
++		// Fades towards both ends of the projection, as the decal pass does
++		const float Fade = saturate(4 - 4 * abs(DecalPosition.x)) * Params.x;
++		const uint WriteMask = (uint)Params.y & ResponseMask;
++
++		BRANCH
++		if (WriteMask & 0x1)
++		{
++			const float4 BaseColor = Texture2DSampleLevel(MobileBasePass.ClusteredDecalAtlasA, MobileBasePass.ClusteredDecalAtlasSampler, AtlasUV, 0);
++			const float Alpha = BaseColor.a * Fade;
++			OutData.PreMulColor = OutData.PreMulColor * (1 - Alpha) + BaseColor.rgb * Alpha;
++			OutData.ColorOpacity *= 1 - Alpha;
++		}
++		BRANCH
++		if (WriteMask & 0x2)
++		{
++			const float4 Normal = Texture2DSampleLevel(MobileBasePass.ClusteredDecalAtlasB, MobileBasePass.ClusteredDecalAtlasSampler, AtlasUV, 0);
++			const float Alpha = Normal.a * Fade;
++			OutData.PreMulWorldNormal = OutData.PreMulWorldNormal * (1 - Alpha) + (Normal.rgb * 2 - 1) * Alpha;
++			OutData.NormalOpacity *= 1 - Alpha;
++		}
++		BRANCH
++		if (WriteMask & 0x4)
++		{
++			const float4 Surface = Texture2DSampleLevel(MobileBasePass.ClusteredDecalAtlasC, MobileBasePass.ClusteredDecalAtlasSampler, AtlasUV, 0);
++			const float Alpha = Surface.a * Fade;
++			OutData.PreMulMetallic = OutData.PreMulMetallic * (1 - Alpha) + Surface.r * Alpha;
++			OutData.PreMulSpecular = OutData.PreMulSpecular * (1 - Alpha) + Surface.g * Alpha;
++			OutData.PreMulRoughness = OutData.PreMulRoughness * (1 - Alpha) + Surface.b * Alpha;
++			OutData.RoughnessOpacity *= 1 - Alpha;
++		}
++		bAnyDecal = true;
++	}
++
++	return bAnyDecal;
++}
+diff --git a/Engine/Source/Runtime/Renderer/Private/DecalRenderingCommon.cpp b/Engine/Source/Runtime/Renderer/Private/DecalRenderingCommon.cpp
+index ba76a2abfbcf..145e4af8cc1b 100644
+--- a/Engine/Source/Runtime/Renderer/Private/DecalRenderingCommon.cpp
++++ b/Engine/Source/Runtime/Renderer/Private/DecalRenderingCommon.cpp
+@@ -1,6 +1,7 @@
+ // Copyright Epic Games, Inc. All Rights Reserved.
+ 
+ #include "DecalRenderingCommon.h"
++#include "MobileClusteredDecals.h"
+ #include "RHIStaticStates.h"
+ #include "RenderUtils.h"
+ #include "DataDrivenShaderPlatformInfo.h"
+@@ -36,6 +37,8 @@ namespace DecalRendering
+ 		const bool bIsDBufferPlatform = IsUsingDBuffers(Platform);
+ 		const bool bIsDBufferMaskPlatform = bIsDBufferPlatform && FDataDrivenShaderPlatformInfo::GetSupportsPerPixelDBufferMask(Platform);
+ 		const bool bIsMobileNormalBlendable = bIsDBufferPlatform || (bIsMobileDeferredPlatform && MobileUsesExtendedGBuffer(Platform) && !IsStaticLightingAllowed());
++		// The forward base pass applies these itself, before lighting, so they keep every output
++		const bool bIsMobileClustered = IsMobileClusteredDecalsEnabled(Platform);
+ 
+ 		Desc.bWriteDBufferMask = bIsDBufferMaskPlatform;
+ 
+@@ -50,11 +53,11 @@ namespace DecalRendering
+ 		}
+ 
+ 		// Enforce platform output limitations.
+-		if (bIsMobilePlatform && !bIsMobileDeferredPlatform && !bIsDBufferPlatform)
++		if (bIsMobilePlatform && !bIsMobileDeferredPlatform && !bIsDBufferPlatform && !bIsMobileClustered)
+ 		{
+ 			Desc.bWriteRoughnessSpecularMetallic = false;
+ 		}
+-		if (bIsMobilePlatform && !bIsMobileNormalBlendable)
++		if (bIsMobilePlatform && !bIsMobileNormalBlendable && !bIsMobileClustered)
+ 		{
+ 			// Note that we disable writing normals for mobile AND mobile deferred.
+ 			// Mobile deferred has octahedral encoding for normals and so doesn't support decal normal blending.
+@@ -76,7 +79,7 @@ namespace DecalRendering
+ 		{
+ 			Desc.RenderStageMask |= 1 << (uint32)EDecalRenderStage::MobileBeforeLighting;
+ 		}
+-		else if ((bIsMobilePlatform && !bIsDBufferPlatform) && (Desc.bWriteEmissive || Desc.bWriteBaseColor))
++		else if ((bIsMobilePlatform && !bIsDBufferPlatform) && (Desc.bWriteEmissive || Desc.bWriteBaseColor || (bIsMobileClustered && (Desc.bWriteNormal || Desc.bWriteRoughnessSpecularMetallic))))
+ 		{
+ 			Desc.RenderStageMask |= 1 << (uint32)EDecalRenderStage::Mobile;
+ 		}
+diff --git a/Engine/Source/Runtime/Renderer/Private/MobileBasePassRendering.cpp b/Engine/Source/Runtime/Renderer/Private/MobileBasePassRendering.cpp
+index 618363265e09..41b562df9110 100644
+--- a/Engine/Source/Runtime/Renderer/Private/MobileBasePassRendering.cpp
++++ b/Engine/Source/Runtime/Renderer/Private/MobileBasePassRendering.cpp
+@@ -6,6 +6,7 @@
+ 
+ #include "MobileBasePassRendering.h"
+ #include "MobileHeightFieldAORendering.h"
++#include "MobileClusteredDecals.h"
+ #include "DynamicPrimitiveDrawing.h"
+ #include "ScenePrivate.h"
+ #include "SceneProxies/SkyLightSceneProxy.h"
+@@ -294,6 +295,7 @@ void MobileBasePassModifyCompilationEnvironment(const FMaterialShaderPermutation
+ 	const bool bTranslucentMSAADepth = bTranslucentMaterial && !bDeferredShadingEnabled && CVarMobileMSAAPerSampleDepthFade.GetValueOnAnyThread() != 0;
+ 	OutEnvironment.SetDefine(TEXT("MOBILE_TRANSLUCENT_MSAA_DEPTH"), bTranslucentMSAADepth ? 1u : 0u);
+ 	OutEnvironment.SetDefine(TEXT("MOBILE_HEIGHTFIELD_GI"), !bDeferredShadingEnabled && IsMobileHeightFieldGIEnabled() ? 1u : 0u);
++	OutEnvironment.SetDefine(TEXT("MOBILE_CLUSTERED_DECALS"), !bTranslucentMaterial && IsMobileClusteredDecalsEnabled(Parameters.Platform) ? 1u : 0u);
+ }
+ 
+ template<typename LightMapPolicyType>
+@@ -410,6 +412,7 @@ void SetupMobileBasePassUniformParameters(
+ 
+ 	BasePassParameters.HeightFieldGITexture = BasePass == EMobileBasePass::Opaque && HasBeenProduced(MobileBasePassTextures.HeightFieldGITexture) ? MobileBasePassTextures.HeightFieldGITexture : SystemTextures.Black;
+ 	BasePassParameters.HeightFieldGISampler = TStaticSamplerState<SF_Bilinear, AM_Clamp, AM_Clamp, AM_Clamp>::GetRHI();
++	SetMobileClusteredDecalParameters(GraphBuilder, BasePass == EMobileBasePass::Opaque ? View.MobileClusteredDecals : nullptr, BasePassParameters);
+ 
+ 	// Substrate
+ 	Substrate::BindSubstrateMobileForwardPasslUniformParameters(GraphBuilder, View, BasePassParameters.Substrate);
+diff --git a/Engine/Source/Runtime/Renderer/Private/MobileBasePassRendering.h b/Engine/Source/Runtime/Renderer/Private/MobileBasePassRendering.h
+index 9a754f39febf..3a951a641231 100644
+--- a/Engine/Source/Runtime/Renderer/Private/MobileBasePassRendering.h
++++ b/Engine/Source/Runtime/Renderer/Private/MobileBasePassRendering.h
+@@ -66,6 +66,16 @@ BEGIN_GLOBAL_SHADER_PARAMETER_STRUCT(FMobileBasePassUniformParameters, )
+ 	SHADER_PARAMETER(uint32, MSAASceneDepthSamples)
+ 	SHADER_PARAMETER_RDG_TEXTURE(Texture2D, HeightFieldGITexture)
+ 	SHADER_PARAMETER_SAMPLER(SamplerState, HeightFieldGISampler)
++	SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<float4>, ClusteredDecalData)
++	SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<uint>, ClusteredDecalTiles)
++	SHADER_PARAMETER_RDG_TEXTURE(Texture2D, ClusteredDecalAtlasA)
++	SHADER_PARAMETER_RDG_TEXTURE(Texture2D, ClusteredDecalAtlasB)
++	SHADER_PARAMETER_RDG_TEXTURE(Texture2D, ClusteredDecalAtlasC)
++	SHADER_PARAMETER_SAMPLER(SamplerState, ClusteredDecalAtlasSampler)
++	SHADER_PARAMETER(FIntPoint, ClusteredDecalTileCount)
++	SHADER_PARAMETER(uint32, ClusteredDecalTileShift)
++	SHADER_PARAMETER(uint32, ClusteredDecalTileStride)
++	SHADER_PARAMETER(uint32, NumClusteredDecals)
+ 	SHADER_PARAMETER(uint32, bApplyHalfResLocalFogToSkyMeshes)
+ 	SHADER_PARAMETER_RDG_TEXTURE(Texture2D, HalfResLocalFogVolumeViewTexture)
+ 	SHADER_PARAMETER_SAMPLER(SamplerState, HalfResLocalFogVolumeViewSampler)
+diff --git a/Engine/Source/Runtime/Renderer/Private/MobileClusteredDecals.cpp b/Engine/Source/Runtime/Renderer/Private/MobileClusteredDecals.cpp
+new file mode 100644
+index 000000000000..fa1fe02bea33
+--- /dev/null
++++ b/Engine/Source/Runtime/Renderer/Private/MobileClusteredDecals.cpp
+@@ -0,0 +1,504 @@
++// Copyright (c) 2026 Jared Taylor.
++
++#include "MobileClusteredDecals.h"
++#include "CompositionLighting/PostProcessDeferredDecals.h"
++#include "DataDrivenShaderPlatformInfo.h"
++#include "DecalRenderingCommon.h"
++#include "DecalRenderingShared.h"
++#include "MaterialShader.h"
++#include "MaterialShared.h"
++#include "Materials/MaterialRenderProxy.h"
++#include "MobileBasePassRendering.h"
++#include "PixelShaderUtils.h"
++#include "ProfilingDebugging/CpuProfilerTrace.h"
++#include "RenderGraphUtils.h"
++#include "SceneExtensions.h"
++#include "ScenePrivate.h"
++#include "SceneRendering.h"
++#include "SceneTextures.h"
++#include "SystemTextures.h"
++
++static TAutoConsoleVariable<int32> CVarMobileClusteredDecals(
++	TEXT("r.Mobile.ClusteredDecals"),
++	0,
++	TEXT("Mobile forward applies deferred decals in the base pass from screen tile lists, before lighting, instead of drawing them over scene colour afterwards. ")
++	TEXT("Decal materials that write base colour, normal or roughness are baked once into an atlas; emissive, modulate and alpha composite decals keep the stock path. ")
++	TEXT("Read only, recompiles materials."),
++	ECVF_ReadOnly | ECVF_RenderThreadSafe);
++
++static TAutoConsoleVariable<int32> CVarMobileClusteredDecalsAtlasSize(
++	TEXT("r.Mobile.ClusteredDecals.AtlasSize"),
++	2048,
++	TEXT("Texels along each side of the decal atlas. Holds (AtlasSize / TileSize) squared decals."),
++	ECVF_Scalability | ECVF_RenderThreadSafe);
++
++static TAutoConsoleVariable<int32> CVarMobileClusteredDecalsTileSize(
++	TEXT("r.Mobile.ClusteredDecals.TileSize"),
++	256,
++	TEXT("Texels along each side of one decal's atlas tile."),
++	ECVF_Scalability | ECVF_RenderThreadSafe);
++
++static TAutoConsoleVariable<int32> CVarMobileClusteredDecalsScreenTileShift(
++	TEXT("r.Mobile.ClusteredDecals.ScreenTileShift"),
++	6,
++	TEXT("Screen tiles are (1 << ScreenTileShift) pixels on a side."),
++	ECVF_Scalability | ECVF_RenderThreadSafe);
++
++static TAutoConsoleVariable<int32> CVarMobileClusteredDecalsMaxPerTile(
++	TEXT("r.Mobile.ClusteredDecals.MaxPerTile"),
++	8,
++	TEXT("Most decals one screen tile applies. Later decals in sort order are dropped from a full tile."),
++	ECVF_Scalability | ECVF_RenderThreadSafe);
++
++static TAutoConsoleVariable<int32> CVarMobileClusteredDecalsRebakeEveryFrame(
++	TEXT("r.Mobile.ClusteredDecals.RebakeEveryFrame"),
++	0,
++	TEXT("Bakes every decal each frame rather than only when it changes, for decal materials animated by time."),
++	ECVF_Scalability | ECVF_RenderThreadSafe);
++
++DECLARE_GPU_STAT_NAMED(MobileClusteredDecals, TEXT("Clustered Decals"));
++
++bool IsMobileClusteredDecalsEnabled(EShaderPlatform Platform)
++{
++	return IsMobilePlatform(Platform)
++		&& !IsMobileDeferredShadingEnabled(Platform)
++		&& !IsUsingDBuffers(Platform)
++		&& !Substrate::IsSubstrateEnabled()
++		&& CVarMobileClusteredDecals.GetValueOnAnyThread() != 0;
++}
++
++bool CanMobileDecalBeClustered(const FDecalBlendDesc& BlendDesc)
++{
++	return !IsModulateBlendMode((EBlendMode)BlendDesc.BlendMode)
++		&& !IsAlphaCompositeBlendMode((EBlendMode)BlendDesc.BlendMode)
++		&& !BlendDesc.bWriteEmissive
++		&& (BlendDesc.bWriteBaseColor || BlendDesc.bWriteNormal || BlendDesc.bWriteRoughnessSpecularMetallic);
++}
++
++/** Evaluates a decal material over its own UV square into one atlas tile: base colour, world normal, and metallic, specular, roughness. */
++class FMobileClusteredDecalBakePS : public FMaterialShader
++{
++	DECLARE_SHADER_TYPE(FMobileClusteredDecalBakePS, Material);
++
++public:
++	static bool ShouldCompilePermutation(const FMaterialShaderPermutationParameters& Parameters)
++	{
++		return Parameters.MaterialParameters.MaterialDomain == MD_DeferredDecal
++			&& IsMobileClusteredDecalsEnabled(Parameters.Platform)
++			&& CanMobileDecalBeClustered(DecalRendering::ComputeDecalBlendDesc(Parameters.Platform, Parameters.MaterialParameters));
++	}
++
++	static void ModifyCompilationEnvironment(const FMaterialShaderPermutationParameters& Parameters, FShaderCompilerEnvironment& OutEnvironment)
++	{
++		FMaterialShader::ModifyCompilationEnvironment(Parameters, OutEnvironment);
++		DecalRendering::ModifyCompilationEnvironment(Parameters.Platform, DecalRendering::ComputeDecalBlendDesc(Parameters.Platform, Parameters.MaterialParameters), EDecalRenderStage::Mobile, OutEnvironment);
++	}
++
++	FMobileClusteredDecalBakePS() {}
++	FMobileClusteredDecalBakePS(const ShaderMetaType::CompiledShaderInitializerType& Initializer)
++		: FMaterialShader(Initializer)
++	{
++		DecalPositionHigh.Bind(Initializer.ParameterMap, TEXT("DecalPositionHigh"));
++		DecalToWorld.Bind(Initializer.ParameterMap, TEXT("DecalToWorld"));
++		DecalToWorldInvScale.Bind(Initializer.ParameterMap, TEXT("DecalToWorldInvScale"));
++		DecalOrientation.Bind(Initializer.ParameterMap, TEXT("DecalOrientation"));
++		DecalParams.Bind(Initializer.ParameterMap, TEXT("DecalParams"));
++		DecalColorParam.Bind(Initializer.ParameterMap, TEXT("DecalColorParam"));
++		BakeTileRect.Bind(Initializer.ParameterMap, TEXT("BakeTileRect"));
++		BakeDecalToTranslatedWorld.Bind(Initializer.ParameterMap, TEXT("BakeDecalToTranslatedWorld"));
++	}
++
++	void SetParameters(FRHIBatchedShaderParameters& BatchedParameters, const FViewInfo& View, const FVisibleDecal& VisibleDecal, const FMaterialRenderProxy* MaterialProxy, const FMaterial* MaterialResource, const FVector4f& TileRect, float LifetimeAlpha)
++	{
++		auto& PrimitivePS = GetUniformBufferParameter<FPrimitiveUniformShaderParameters>();
++		SetUniformBufferParameter(BatchedParameters, PrimitivePS, GIdentityPrimitiveUniformBuffer);
++
++		FMaterialShader::SetParameters(BatchedParameters, MaterialProxy, *MaterialResource, View);
++
++		const FMatrix DecalToWorldMatrix = VisibleDecal.ComponentTrans.ToMatrixWithScale();
++		const FDFVector3 AbsoluteOrigin(DecalToWorldMatrix.GetOrigin());
++		const FVector3f PositionHigh = AbsoluteOrigin.High;
++
++		SetShaderValue(BatchedParameters, DecalPositionHigh, PositionHigh);
++		SetShaderValue(BatchedParameters, DecalToWorld, FDFMatrix::MakeToRelativeWorldMatrix(PositionHigh, DecalToWorldMatrix).M);
++		SetShaderValue(BatchedParameters, DecalToWorldInvScale, static_cast<FVector3f>(DecalToWorldMatrix.GetScaleVector().Reciprocal()));
++		SetShaderValue(BatchedParameters, DecalOrientation, (FVector3f)VisibleDecal.ComponentTrans.GetUnitAxis(EAxis::X));
++		SetShaderValue(BatchedParameters, DecalParams, FVector2f(1.0f, LifetimeAlpha));
++		SetShaderValue(BatchedParameters, DecalColorParam, VisibleDecal.DecalColor);
++		SetShaderValue(BatchedParameters, BakeTileRect, TileRect);
++		SetShaderValue(BatchedParameters, BakeDecalToTranslatedWorld, FMatrix44f(DecalToWorldMatrix * FTranslationMatrix(View.ViewMatrices.GetPreViewTranslation())));
++	}
++
++private:
++	LAYOUT_FIELD(FShaderParameter, DecalPositionHigh);
++	LAYOUT_FIELD(FShaderParameter, DecalToWorld);
++	LAYOUT_FIELD(FShaderParameter, DecalToWorldInvScale);
++	LAYOUT_FIELD(FShaderParameter, DecalOrientation);
++	LAYOUT_FIELD(FShaderParameter, DecalParams);
++	LAYOUT_FIELD(FShaderParameter, DecalColorParam);
++	LAYOUT_FIELD(FShaderParameter, BakeTileRect);
++	LAYOUT_FIELD(FShaderParameter, BakeDecalToTranslatedWorld);
++};
++
++IMPLEMENT_MATERIAL_SHADER_TYPE(, FMobileClusteredDecalBakePS, TEXT("/Engine/Private/MobileClusteredDecalBake.usf"), TEXT("MainPS"), SF_Pixel);
++
++class FMobileClusteredDecalAtlas : public ISceneExtension
++{
++	DECLARE_SCENE_EXTENSION(, FMobileClusteredDecalAtlas);
++
++public:
++	using ISceneExtension::ISceneExtension;
++
++	struct FSlot
++	{
++		uintptr_t Component = 0;
++		uint32 Hash = 0;
++		uint32 LastUsedFrame = 0;
++	};
++
++	TRefCountPtr<IPooledRenderTarget> Atlas[3];
++	int32 AtlasSize = 0;
++	int32 TileSize = 0;
++	TArray<FSlot> Slots;
++	TMap<uintptr_t, int32> SlotByComponent;
++
++	int32 TilesPerSide() const { return AtlasSize / TileSize; }
++
++	FIntPoint GetTileMin(int32 Slot) const { return FIntPoint(Slot % TilesPerSide(), Slot / TilesPerSide()) * TileSize; }
++
++	/** A free slot, or the one least recently used before this frame. INDEX_NONE when every slot is in use this frame. */
++	int32 Allocate(uintptr_t Component, uint32 FrameNumber)
++	{
++		int32 Best = INDEX_NONE;
++		for (int32 Index = 0; Index < Slots.Num(); Index++)
++		{
++			const FSlot& Slot = Slots[Index];
++			if (Slot.Component == 0)
++			{
++				Best = Index;
++				break;
++			}
++			if (Slot.LastUsedFrame != FrameNumber && (Best == INDEX_NONE || Slot.LastUsedFrame < Slots[Best].LastUsedFrame))
++			{
++				Best = Index;
++			}
++		}
++
++		if (Best != INDEX_NONE)
++		{
++			SlotByComponent.Remove(Slots[Best].Component);
++			Slots[Best] = FSlot{ Component, 0, FrameNumber };
++			SlotByComponent.Add(Component, Best);
++		}
++		return Best;
++	}
++};
++
++IMPLEMENT_SCENE_EXTENSION(FMobileClusteredDecalAtlas);
++
++namespace MobileClusteredDecals
++{
++	/** Five float4 per decal: translated world to decal space (three rows), atlas scale and bias, then (fade, write mask, 0, 0). */
++	constexpr int32 Float4PerDecal = 5;
++
++	struct FBake
++	{
++		const FVisibleDecal* Decal;
++		const FMaterialRenderProxy* MaterialProxy;
++		const FMaterial* Material;
++		TShaderRef<FMobileClusteredDecalBakePS> PixelShader;
++		FIntPoint TileMin;
++		float LifetimeAlpha;
++	};
++
++	static float GetLifetimeAlpha(const FViewInfo& View, const FVisibleDecal& Decal)
++	{
++		// Matches the scene colour decal pass. Captures without a world time stay fully opaque.
++		const double Time = View.Family->Time.GetWorldTimeSeconds();
++		if (!Time)
++		{
++			return 1.0f;
++		}
++		return FMath::Clamp(FMath::Min((float)Time * -Decal.InvFadeDuration + Decal.FadeStartDelayNormalized, (float)Time * Decal.InvFadeInDuration + Decal.FadeInStartDelayNormalized), 0.0f, 1.0f);
++	}
++
++	static uint32 GetBakeHash(const FVisibleDecal& Decal, float LifetimeAlpha)
++	{
++		const FMatrix44f Matrix(Decal.ComponentTrans.ToMatrixWithScale());
++		uint32 Hash = FCrc::MemCrc32(&Matrix, sizeof(Matrix));
++		Hash = HashCombine(Hash, PointerHash(Decal.MaterialProxy));
++		Hash = HashCombine(Hash, GetTypeHash(Decal.DecalColor));
++		Hash = HashCombine(Hash, GetTypeHash(FMath::RoundToInt32(LifetimeAlpha * 255.0f)));
++		// Zero means not baked
++		return Hash ? Hash : 1;
++	}
++
++	static void EnsureAtlas(FRDGBuilder& GraphBuilder, FMobileClusteredDecalAtlas& Atlas)
++	{
++		const int32 TileSize = FMath::Clamp((int32)FMath::RoundUpToPowerOfTwo((uint32)FMath::Max(CVarMobileClusteredDecalsTileSize.GetValueOnRenderThread(), 1)), 16, 2048);
++		const int32 AtlasSize = FMath::Clamp((int32)FMath::RoundUpToPowerOfTwo((uint32)FMath::Max(CVarMobileClusteredDecalsAtlasSize.GetValueOnRenderThread(), 1)), TileSize, 8192);
++		if (Atlas.Atlas[0] && Atlas.AtlasSize == AtlasSize && Atlas.TileSize == TileSize)
++		{
++			return;
++		}
++
++		Atlas.AtlasSize = AtlasSize;
++		Atlas.TileSize = TileSize;
++		Atlas.Slots.Reset();
++		Atlas.Slots.SetNum(FMath::Square(Atlas.TilesPerSide()));
++		Atlas.SlotByComponent.Reset();
++
++		static const TCHAR* Names[] = { TEXT("MobileClusteredDecalAtlasA"), TEXT("MobileClusteredDecalAtlasB"), TEXT("MobileClusteredDecalAtlasC") };
++		for (int32 Index = 0; Index < 3; Index++)
++		{
++			const FRDGTextureDesc Desc = FRDGTextureDesc::Create2D(FIntPoint(AtlasSize), PF_B8G8R8A8, FClearValueBinding::Transparent, TexCreate_ShaderResource | TexCreate_RenderTargetable);
++			FRDGTextureRef Texture = GraphBuilder.CreateTexture(Desc, Names[Index]);
++			AddClearRenderTargetPass(GraphBuilder, Texture);
++			Atlas.Atlas[Index] = GraphBuilder.ConvertToExternalTexture(Texture);
++		}
++	}
++
++	/** The decal box's footprint on screen in view-relative pixels, or the whole view when part of it is behind the camera. */
++	static FIntRect GetScreenRect(const FViewInfo& View, const FVisibleDecal& Decal)
++	{
++		const FIntPoint ViewSize = View.ViewRect.Size();
++		const FIntRect WholeView(FIntPoint::ZeroValue, ViewSize);
++		const FMatrix DecalToClip = Decal.ComponentTrans.ToMatrixWithScale() * View.ViewMatrices.GetWorldToClip();
++
++		FVector2D Min(UE_BIG_NUMBER), Max(-UE_BIG_NUMBER);
++		for (int32 Corner = 0; Corner < 8; Corner++)
++		{
++			const FVector4 Clip = DecalToClip.TransformFVector4(FVector4((Corner & 1) ? 1.0 : -1.0, (Corner & 2) ? 1.0 : -1.0, (Corner & 4) ? 1.0 : -1.0, 1.0));
++			if (Clip.W <= UE_KINDA_SMALL_NUMBER)
++			{
++				return WholeView;
++			}
++			const FVector2D Pixel((Clip.X / Clip.W * 0.5 + 0.5) * ViewSize.X, (0.5 - Clip.Y / Clip.W * 0.5) * ViewSize.Y);
++			Min = FVector2D::Min(Min, Pixel);
++			Max = FVector2D::Max(Max, Pixel);
++		}
++
++		FIntRect Rect(FIntPoint(FMath::FloorToInt32(Min.X), FMath::FloorToInt32(Min.Y)), FIntPoint(FMath::CeilToInt32(Max.X), FMath::CeilToInt32(Max.Y)));
++		Rect.Clip(WholeView);
++		return Rect;
++	}
++
++	static void AddBakePass(FRDGBuilder& GraphBuilder, FViewInfo& View, const FMobileClusteredDecalAtlas& Atlas, const FSceneTextures& SceneTextures, TArray<FBake, SceneRenderingAllocator>&& Bakes)
++	{
++		FDeferredDecalPassTextures DecalPassTextures = GetDeferredDecalPassTextures(GraphBuilder, View, SceneTextures, nullptr, EDecalRenderStage::BeforeBasePass);
++
++		FDeferredDecalPassParameters* PassParameters = GraphBuilder.AllocParameters<FDeferredDecalPassParameters>();
++		PassParameters->View = View.GetShaderParameters();
++		PassParameters->Scene = View.GetSceneUniforms().GetBuffer(GraphBuilder);
++		PassParameters->DeferredDecal = CreateDeferredDecalUniformBuffer(View);
++		PassParameters->DecalPass = DecalPassTextures.DecalPassUniformBuffer;
++		for (int32 Index = 0; Index < 3; Index++)
++		{
++			PassParameters->RenderTargets[Index] = FRenderTargetBinding(GraphBuilder.RegisterExternalTexture(Atlas.Atlas[Index]), ERenderTargetLoadAction::ELoad);
++		}
++
++		const int32 TileSize = Atlas.TileSize;
++		const FViewInfo* ViewPtr = &View;
++		GraphBuilder.AddPass(
++			RDG_EVENT_NAME("BakeDecals %d", Bakes.Num()),
++			PassParameters,
++			ERDGPassFlags::Raster,
++			[ViewPtr, TileSize, Bakes = MoveTemp(Bakes)](FRHICommandList& RHICmdList)
++			{
++				for (const FBake& Bake : Bakes)
++				{
++					RHICmdList.SetViewport(Bake.TileMin.X, Bake.TileMin.Y, 0.0f, Bake.TileMin.X + TileSize, Bake.TileMin.Y + TileSize, 1.0f);
++
++					FGraphicsPipelineStateInitializer GraphicsPSOInit;
++					RHICmdList.ApplyCachedRenderTargets(GraphicsPSOInit);
++					FPixelShaderUtils::InitFullscreenPipelineState(RHICmdList, ViewPtr->ShaderMap, Bake.PixelShader, GraphicsPSOInit);
++					SetGraphicsPipelineState(RHICmdList, GraphicsPSOInit, 0);
++
++					const FVector4f TileRect((float)Bake.TileMin.X, (float)Bake.TileMin.Y, 1.0f / TileSize, 1.0f / TileSize);
++					SetShaderParametersLegacyPS(RHICmdList, Bake.PixelShader, *ViewPtr, *Bake.Decal, Bake.MaterialProxy, Bake.Material, TileRect, Bake.LifetimeAlpha);
++					FPixelShaderUtils::DrawFullscreenTriangle(RHICmdList);
++				}
++			});
++	}
++}
++
++void BuildMobileClusteredDecals(FRDGBuilder& GraphBuilder, FScene* Scene, FViewInfo& View, TConstArrayView<const FVisibleDecal*> RelevantDecals, const FSceneTextures& SceneTextures)
++{
++	TRACE_CPUPROFILER_EVENT_SCOPE(MobileClusteredDecals::BuildMobileClusteredDecals);
++
++	View.MobileClusteredDecals = nullptr;
++	const EShaderPlatform Platform = View.GetShaderPlatform();
++	FMobileClusteredDecalAtlas* Atlas = Scene ? Scene->GetExtensionPtr<FMobileClusteredDecalAtlas>() : nullptr;
++	if (!Atlas || !IsMobileClusteredDecalsEnabled(Platform) || RelevantDecals.IsEmpty() || !View.Family->EngineShowFlags.Decals)
++	{
++		return;
++	}
++
++	RDG_EVENT_SCOPE_STAT(GraphBuilder, MobileClusteredDecals, "MobileClusteredDecals");
++
++	MobileClusteredDecals::EnsureAtlas(GraphBuilder, *Atlas);
++
++	const uint32 FrameNumber = View.Family->FrameNumber;
++	const bool bRebakeAll = CVarMobileClusteredDecalsRebakeEveryFrame.GetValueOnRenderThread() != 0;
++	const ERHIFeatureLevel::Type FeatureLevel = View.GetFeatureLevel();
++
++	TArray<MobileClusteredDecals::FBake, SceneRenderingAllocator> Bakes;
++	TArray<TPair<const FVisibleDecal*, int32>, SceneRenderingAllocator> Placed;
++
++	for (const FVisibleDecal* Decal : RelevantDecals)
++	{
++		if (!CanMobileDecalBeClustered(Decal->BlendDesc))
++		{
++			continue;
++		}
++
++		// A material still compiling falls back to the scene colour path until its bake shader exists
++		const FMaterialRenderProxy* MaterialProxy = Decal->MaterialProxy;
++		const FMaterial* Material = MaterialProxy ? MaterialProxy->GetMaterialNoFallback(FeatureLevel) : nullptr;
++		FMaterialShaders Shaders;
++		FMaterialShaderTypes ShaderTypes;
++		ShaderTypes.AddShaderType<FMobileClusteredDecalBakePS>();
++		TShaderRef<FMobileClusteredDecalBakePS> PixelShader;
++		if (!Material || !Material->TryGetShaders(ShaderTypes, nullptr, Shaders) || !Shaders.TryGetPixelShader(PixelShader))
++		{
++			continue;
++		}
++
++		int32 SlotIndex = Atlas->SlotByComponent.FindRef(Decal->Component, INDEX_NONE);
++		if (SlotIndex == INDEX_NONE)
++		{
++			SlotIndex = Atlas->Allocate(Decal->Component, FrameNumber);
++			if (SlotIndex == INDEX_NONE)
++			{
++				continue;
++			}
++		}
++
++		FMobileClusteredDecalAtlas::FSlot& Slot = Atlas->Slots[SlotIndex];
++		Slot.LastUsedFrame = FrameNumber;
++
++		const float LifetimeAlpha = MobileClusteredDecals::GetLifetimeAlpha(View, *Decal);
++		const uint32 Hash = MobileClusteredDecals::GetBakeHash(*Decal, LifetimeAlpha);
++		if (bRebakeAll || Slot.Hash != Hash)
++		{
++			Slot.Hash = Hash;
++			Bakes.Add({ Decal, MaterialProxy, Material, PixelShader, Atlas->GetTileMin(SlotIndex), LifetimeAlpha });
++		}
++		Placed.Emplace(Decal, SlotIndex);
++	}
++
++	if (Placed.IsEmpty())
++	{
++		return;
++	}
++
++	if (!Bakes.IsEmpty())
++	{
++		MobileClusteredDecals::AddBakePass(GraphBuilder, View, *Atlas, SceneTextures, MoveTemp(Bakes));
++	}
++
++	const uint32 TileShift = FMath::Clamp(CVarMobileClusteredDecalsScreenTileShift.GetValueOnRenderThread(), 3, 8);
++	const uint32 MaxPerTile = FMath::Clamp(CVarMobileClusteredDecalsMaxPerTile.GetValueOnRenderThread(), 1, 32);
++	const uint32 TileStride = MaxPerTile + 1;
++	const FIntPoint TileCount(
++		FMath::DivideAndRoundUp(View.ViewRect.Width(), 1 << TileShift),
++		FMath::DivideAndRoundUp(View.ViewRect.Height(), 1 << TileShift));
++
++	TArray<FVector4f, SceneRenderingAllocator> DecalData;
++	TArray<uint32, SceneRenderingAllocator> TileData;
++	DecalData.Reserve(Placed.Num() * MobileClusteredDecals::Float4PerDecal);
++	TileData.SetNumZeroed(TileCount.X * TileCount.Y * TileStride);
++
++	FMobileClusteredDecalViewData* ViewData = GraphBuilder.AllocObject<FMobileClusteredDecalViewData>();
++	const FMatrix TranslatedWorldToWorld = FTranslationMatrix(-View.ViewMatrices.GetPreViewTranslation());
++	const float AtlasTexel = 1.0f / Atlas->AtlasSize;
++
++	for (const TPair<const FVisibleDecal*, int32>& Entry : Placed)
++	{
++		const FVisibleDecal& Decal = *Entry.Key;
++		const FIntRect ScreenRect = MobileClusteredDecals::GetScreenRect(View, Decal);
++		if (ScreenRect.Area() <= 0)
++		{
++			continue;
++		}
++
++		const uint32 DecalIndex = ViewData->NumDecals++;
++		ViewData->Decals.Add(Entry.Key);
++
++		const FMatrix TranslatedWorldToDecal = TranslatedWorldToWorld * Decal.ComponentTrans.ToInverseMatrixWithScale();
++		for (int32 Column = 0; Column < 3; Column++)
++		{
++			DecalData.Add(FVector4f(
++				(float)TranslatedWorldToDecal.M[0][Column], (float)TranslatedWorldToDecal.M[1][Column],
++				(float)TranslatedWorldToDecal.M[2][Column], (float)TranslatedWorldToDecal.M[3][Column]));
++		}
++
++		// Half a texel in from the tile's edges, so bilinear filtering never reads a neighbouring decal
++		const FIntPoint TileMin = Atlas->GetTileMin(Entry.Value);
++		DecalData.Add(FVector4f(
++			(Atlas->TileSize - 1) * AtlasTexel, (Atlas->TileSize - 1) * AtlasTexel,
++			(TileMin.X + 0.5f) * AtlasTexel, (TileMin.Y + 0.5f) * AtlasTexel));
++
++		const uint32 WriteMask = (Decal.BlendDesc.bWriteBaseColor ? 1u : 0u) | (Decal.BlendDesc.bWriteNormal ? 2u : 0u) | (Decal.BlendDesc.bWriteRoughnessSpecularMetallic ? 4u : 0u);
++		DecalData.Add(FVector4f(Decal.FadeAlpha, (float)WriteMask, 0.0f, 0.0f));
++
++		const FIntPoint FirstTile(ScreenRect.Min.X >> TileShift, ScreenRect.Min.Y >> TileShift);
++		const FIntPoint LastTile(FMath::Min((ScreenRect.Max.X - 1) >> TileShift, TileCount.X - 1), FMath::Min((ScreenRect.Max.Y - 1) >> TileShift, TileCount.Y - 1));
++		for (int32 Y = FirstTile.Y; Y <= LastTile.Y; Y++)
++		{
++			for (int32 X = FirstTile.X; X <= LastTile.X; X++)
++			{
++				uint32* Tile = &TileData[(Y * TileCount.X + X) * TileStride];
++				if (Tile[0] < MaxPerTile)
++				{
++					Tile[1 + Tile[0]++] = DecalIndex;
++				}
++			}
++		}
++	}
++
++	if (ViewData->NumDecals == 0)
++	{
++		return;
++	}
++
++	ViewData->DecalData = GraphBuilder.CreateSRV(CreateStructuredBuffer(GraphBuilder, TEXT("MobileClusteredDecals.Decals"), TConstArrayView<FVector4f>(DecalData)));
++	ViewData->TileData = GraphBuilder.CreateSRV(CreateStructuredBuffer(GraphBuilder, TEXT("MobileClusteredDecals.Tiles"), TConstArrayView<uint32>(TileData)));
++	ViewData->AtlasA = GraphBuilder.RegisterExternalTexture(Atlas->Atlas[0]);
++	ViewData->AtlasB = GraphBuilder.RegisterExternalTexture(Atlas->Atlas[1]);
++	ViewData->AtlasC = GraphBuilder.RegisterExternalTexture(Atlas->Atlas[2]);
++	ViewData->TileCount = TileCount;
++	ViewData->TileSizeShift = TileShift;
++	ViewData->TileStride = TileStride;
++	View.MobileClusteredDecals = ViewData;
++}
++
++void SetMobileClusteredDecalParameters(FRDGBuilder& GraphBuilder, const FMobileClusteredDecalViewData* ViewData, FMobileBasePassUniformParameters& Parameters)
++{
++	const FRDGSystemTextures& SystemTextures = FRDGSystemTextures::Get(GraphBuilder);
++	Parameters.ClusteredDecalAtlasSampler = TStaticSamplerState<SF_Bilinear, AM_Clamp, AM_Clamp, AM_Clamp>::GetRHI();
++	if (ViewData)
++	{
++		Parameters.ClusteredDecalData = ViewData->DecalData;
++		Parameters.ClusteredDecalTiles = ViewData->TileData;
++		Parameters.ClusteredDecalAtlasA = ViewData->AtlasA;
++		Parameters.ClusteredDecalAtlasB = ViewData->AtlasB;
++		Parameters.ClusteredDecalAtlasC = ViewData->AtlasC;
++		Parameters.ClusteredDecalTileCount = ViewData->TileCount;
++		Parameters.ClusteredDecalTileShift = ViewData->TileSizeShift;
++		Parameters.ClusteredDecalTileStride = ViewData->TileStride;
++		Parameters.NumClusteredDecals = ViewData->NumDecals;
++	}
++	else
++	{
++		Parameters.ClusteredDecalData = GraphBuilder.CreateSRV(GSystemTextures.GetDefaultStructuredBuffer(GraphBuilder, sizeof(FVector4f)));
++		Parameters.ClusteredDecalTiles = GraphBuilder.CreateSRV(GSystemTextures.GetDefaultStructuredBuffer(GraphBuilder, sizeof(uint32)));
++		Parameters.ClusteredDecalAtlasA = SystemTextures.Black;
++		Parameters.ClusteredDecalAtlasB = SystemTextures.Black;
++		Parameters.ClusteredDecalAtlasC = SystemTextures.Black;
++		Parameters.ClusteredDecalTileCount = FIntPoint::ZeroValue;
++		Parameters.ClusteredDecalTileShift = 0;
++		Parameters.ClusteredDecalTileStride = 0;
++		Parameters.NumClusteredDecals = 0;
++	}
++}
+diff --git a/Engine/Source/Runtime/Renderer/Private/MobileClusteredDecals.h b/Engine/Source/Runtime/Renderer/Private/MobileClusteredDecals.h
+new file mode 100644
+index 000000000000..6d5b81304565
+--- /dev/null
++++ b/Engine/Source/Runtime/Renderer/Private/MobileClusteredDecals.h
+@@ -0,0 +1,47 @@
++// Copyright (c) 2026 Jared Taylor.
++
++#pragma once
++
++#include "CoreMinimal.h"
++#include "RenderGraphFwd.h"
++#include "RHIShaderPlatform.h"
++
++class FScene;
++class FViewInfo;
++union FDecalBlendDesc;
++class FMobileBasePassUniformParameters;
++struct FSceneTextures;
++struct FVisibleDecal;
++
++/**
++ * r.Mobile.ClusteredDecals: the forward base pass applies deferred decals itself, from screen tile lists, before lighting.
++ * Each decal's material is baked once into a shared atlas tile, so its base colour, normal and roughness change the surface
++ * that every light then shades, at every MSAA sample.
++ */
++bool IsMobileClusteredDecalsEnabled(EShaderPlatform Platform);
++
++/** Decals whose material writes base colour, normal or roughness and nothing else; the rest keep drawing over scene colour. */
++bool CanMobileDecalBeClustered(const FDecalBlendDesc& BlendDesc);
++
++/** One view's decals for the base pass. */
++struct FMobileClusteredDecalViewData
++{
++	FRDGBufferSRVRef DecalData = nullptr;
++	FRDGBufferSRVRef TileData = nullptr;
++	FRDGTextureRef AtlasA = nullptr;
++	FRDGTextureRef AtlasB = nullptr;
++	FRDGTextureRef AtlasC = nullptr;
++	FIntPoint TileCount = FIntPoint::ZeroValue;
++	uint32 TileSizeShift = 0;
++	uint32 TileStride = 0;
++	uint32 NumDecals = 0;
++
++	/** Decals the base pass applies, which the scene colour decal pass skips. */
++	TSet<const FVisibleDecal*> Decals;
++};
++
++/** Bakes any decals new to the atlas and builds the view's tile lists. Leaves View.MobileClusteredDecals null when there are none. */
++void BuildMobileClusteredDecals(FRDGBuilder& GraphBuilder, FScene* Scene, FViewInfo& View, TConstArrayView<const FVisibleDecal*> RelevantDecals, const FSceneTextures& SceneTextures);
++
++/** Binds the view's decals into the base pass, or empty ones. */
++void SetMobileClusteredDecalParameters(FRDGBuilder& GraphBuilder, const FMobileClusteredDecalViewData* ViewData, FMobileBasePassUniformParameters& Parameters);
+diff --git a/Engine/Source/Runtime/Renderer/Private/MobileDecalRendering.cpp b/Engine/Source/Runtime/Renderer/Private/MobileDecalRendering.cpp
+index 74d37c9105bf..b6314d113f90 100644
+--- a/Engine/Source/Runtime/Renderer/Private/MobileDecalRendering.cpp
++++ b/Engine/Source/Runtime/Renderer/Private/MobileDecalRendering.cpp
+@@ -19,6 +19,7 @@
+ #include "DataDrivenShaderPlatformInfo.h"
+ #include "CompositionLighting/PostProcessDeferredDecals.h"
+ #include "DBufferTextures.h"
++#include "MobileClusteredDecals.h"
+ 
+ 
+ 
+@@ -91,6 +92,11 @@ void FMobileSceneRenderer::RenderDeferredDecalsMobile(FRHICommandList& RHICmdLis
+ 
+ 	for (const FVisibleDecal* VisibleDecal : DecalViewInfo.RelevantDeferredDecals)
+ 	{
++		if (View.MobileClusteredDecals && View.MobileClusteredDecals->Decals.Contains(VisibleDecal))
++		{
++			continue;
++		}
++
+ 		if (DecalViewInfo.RenderTargetMode == DecalRendering::GetRenderTargetMode(View.GetShaderPlatform(), VisibleDecal->BlendDesc, DecalViewInfo.RenderStage))
+ 		{
+ 			SortedDecals.Add(VisibleDecal);
+diff --git a/Engine/Source/Runtime/Renderer/Private/MobileShadingRenderer.cpp b/Engine/Source/Runtime/Renderer/Private/MobileShadingRenderer.cpp
+index 7b2162887fca..3b2810e2e7d2 100644
+--- a/Engine/Source/Runtime/Renderer/Private/MobileShadingRenderer.cpp
++++ b/Engine/Source/Runtime/Renderer/Private/MobileShadingRenderer.cpp
+@@ -101,6 +101,7 @@
+ #include "SceneExtensions.h"
+ #include "MobileHeightFieldAORendering.h"
+ #include "MobilePrimitiveAORendering.h"
++#include "MobileClusteredDecals.h"
+ #include "SceneInterface.h"
+ #include "SceneManagement.h"
+ #include "SceneOcclusion.h"
+@@ -2189,6 +2190,11 @@ void FMobileSceneRenderer::RenderForward(FRDGBuilder& GraphBuilder, FRDGTextureR
+ 
+ 		UpdateDirectionalLightUniformBuffers(GraphBuilder, View);
+ 			
++		if (ViewContext.DecalViewOffset != INDEX_NONE && IsMobileClusteredDecalsEnabled(View.GetShaderPlatform()))
++		{
++			BuildMobileClusteredDecals(GraphBuilder, Scene, View, GetRelevantDeferredDecals(ViewContext.DecalViewOffset, ViewContext.ViewIndex, EDecalRenderStage::Mobile), SceneTextures);
++		}
++
+ 		EMobileSceneTextureSetupMode SetupMode = (bIsFullDepthPrepassEnabled ? EMobileSceneTextureSetupMode::SceneDepth : EMobileSceneTextureSetupMode::None) | EMobileSceneTextureSetupMode::CustomDepth;
+ 		FMobileRenderPassParameters* PassParameters = GraphBuilder.AllocParameters<FMobileRenderPassParameters>();
+ 		PassParameters->View = View.GetShaderParameters();
+diff --git a/Engine/Source/Runtime/Renderer/Private/SceneRendering.h b/Engine/Source/Runtime/Renderer/Private/SceneRendering.h
+index fb4e5ac0f252..8821a96b9d43 100644
+--- a/Engine/Source/Runtime/Renderer/Private/SceneRendering.h
++++ b/Engine/Source/Runtime/Renderer/Private/SceneRendering.h
+@@ -1565,6 +1565,9 @@ public:
+ 	TUniformBufferRef<FReflectionCaptureShaderData> ReflectionCaptureUniformBuffer;
+ 	TUniformBufferRef<FMobileReflectionCaptureShaderData> MobileReflectionCaptureUniformBuffer;
+ 
++	/** Decals the mobile forward base pass applies itself this frame (r.Mobile.ClusteredDecals), or null. */
++	struct FMobileClusteredDecalViewData* MobileClusteredDecals = nullptr;
++
+ 	// Sky / Atmosphere textures (transient owned by this view info) and pointer to constants owned by SkyAtmosphere proxy.
+ 	TRefCountPtr<IPooledRenderTarget> SkyAtmosphereCameraAerialPerspectiveVolume;
+ 	TRefCountPtr<IPooledRenderTarget> SkyAtmosphereCameraAerialPerspectiveVolumeMieOnly;

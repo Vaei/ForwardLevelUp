@@ -10,8 +10,17 @@
 #include "Misc/App.h"
 #include "MobileHeightFieldAO.h"
 #include "ProfilingDebugging/CpuProfilerTrace.h"
+#include "RenderGraphBuilder.h"
+#include "RenderGraphUtils.h"
+#include "TextureResource.h"
 
 #include UE_INLINE_GENERATED_CPP_BY_NAME(HeightFieldAOCapture)
+
+namespace HeightFieldAO
+{
+	/** Texels nothing has been captured into read as the bottom of the world, so they never occlude. */
+	const FLinearColor EmptyTexel(0.f, 0.f, 0.f, 65000.f);
+}
 
 AHeightFieldAOCapture::AHeightFieldAOCapture()
 {
@@ -37,6 +46,7 @@ AHeightFieldAOCapture::AHeightFieldAOCapture()
 	CaptureComponent->bCaptureOnMovement = false;
 	CaptureComponent->PrimitiveRenderMode = ESceneCapturePrimitiveRenderMode::PRM_LegacySceneCapture;
 
+	// Unlit, so the colour is the albedo that height field GI bounces
 	FEngineShowFlags& Flags = CaptureComponent->ShowFlags;
 	Flags.SetSkeletalMeshes(false);
 	Flags.SetParticles(false);
@@ -52,6 +62,7 @@ AHeightFieldAOCapture::AHeightFieldAOCapture()
 
 void AHeightFieldAOCapture::Recapture()
 {
+	bWindowStarted = false;
 	SetActorTickEnabled(true);
 }
 
@@ -85,8 +96,37 @@ void AHeightFieldAOCapture::Tick(float DeltaSeconds)
 
 	Super::Tick(DeltaSeconds);
 
+	if (bFollowView)
+	{
+		UpdateWindow();
+		return;
+	}
+
 	SetActorTickEnabled(false);
 	Capture();
+}
+
+UTextureRenderTarget2D* AHeightFieldAOCapture::MakeTarget(const TCHAR* Name, int32 Size) const
+{
+	UTextureRenderTarget2D* Target = NewObject<UTextureRenderTarget2D>(const_cast<AHeightFieldAOCapture*>(this), Name, RF_Transient);
+	Target->RenderTargetFormat = RTF_RGBA16f;
+	Target->ClearColor = HeightFieldAO::EmptyTexel;
+	Target->InitAutoFormat(Size, Size);
+	Target->UpdateResourceImmediate(true);
+	return Target;
+}
+
+void AHeightFieldAOCapture::HideMovableActors()
+{
+	CaptureComponent->HiddenActors.Reset();
+	for (AActor* Actor : TActorRange<AActor>(GetWorld()))
+	{
+		const USceneComponent* Root = Actor->GetRootComponent();
+		if (Root && Root->Mobility == EComponentMobility::Movable)
+		{
+			CaptureComponent->HiddenActors.Add(Actor);
+		}
+	}
 }
 
 void AHeightFieldAOCapture::Capture()
@@ -101,11 +141,7 @@ void AHeightFieldAOCapture::Capture()
 
 	if (!HeightTarget || HeightTarget->SizeX != Resolution)
 	{
-		HeightTarget = NewObject<UTextureRenderTarget2D>(this, TEXT("HeightTarget"), RF_Transient);
-		HeightTarget->RenderTargetFormat = RTF_RGBA16f;
-		HeightTarget->ClearColor = FLinearColor(UE_BIG_NUMBER, 0.f, 0.f, 0.f);
-		HeightTarget->InitAutoFormat(Resolution, Resolution);
-		HeightTarget->UpdateResourceImmediate(true);
+		HeightTarget = MakeTarget(TEXT("HeightTarget"), Resolution);
 	}
 
 	const FBox Square = GetSquareBounds();
@@ -113,20 +149,135 @@ void AHeightFieldAOCapture::Capture()
 	CaptureComponent->OrthoWidth = Square.GetSize().X;
 	CaptureComponent->SetWorldLocationAndRotation(FVector(Square.GetCenter().X, Square.GetCenter().Y, Square.Max.Z), FRotator(-90.f, 0.f, 0.f));
 
-	CaptureComponent->HiddenActors.Reset();
-	for (AActor* Actor : TActorRange<AActor>(World))
-	{
-		const USceneComponent* Root = Actor->GetRootComponent();
-		if (Root && Root->Mobility == EComponentMobility::Movable)
-		{
-			CaptureComponent->HiddenActors.Add(Actor);
-		}
-	}
-
+	HideMovableActors();
 	CaptureComponent->CaptureScene();
 	CaptureComponent->HiddenActors.Reset();
 
 	SetMobileHeightFieldAO(World->Scene, HeightTarget, Square);
+}
+
+void AHeightFieldAOCapture::UpdateWindow()
+{
+	TRACE_CPUPROFILER_EVENT_SCOPE(HeightFieldAOCapture::UpdateWindow);
+
+	UWorld* World = GetWorld();
+	if (!World || !World->Scene || !FApp::CanEverRender() || World->ViewLocationsRenderedLastFrame.IsEmpty())
+	{
+		return;
+	}
+
+	const int32 TileResolution = FMath::Max(Resolution / TilesPerAxis, 16);
+	if (!bWindowStarted || !HeightTarget || HeightTarget->SizeX != TileResolution * TilesPerAxis)
+	{
+		HeightTarget = MakeTarget(TEXT("HeightTarget"), TileResolution * TilesPerAxis);
+		TileTarget = MakeTarget(TEXT("TileTarget"), TileResolution);
+		ValidTiles = FIntRect();
+		Window = FIntRect();
+		bWindowStarted = true;
+	}
+
+	const double TileSize = WindowSize / TilesPerAxis;
+	const FVector& ViewLocation = World->ViewLocationsRenderedLastFrame[0];
+	const FIntPoint ViewTile(FMath::FloorToInt32(ViewLocation.X / TileSize), FMath::FloorToInt32(ViewLocation.Y / TileSize));
+	const FIntPoint WindowMin = ViewTile - FIntPoint(TilesPerAxis / 2);
+	const FIntRect NewWindow(WindowMin, WindowMin + FIntPoint(TilesPerAxis));
+
+	if (NewWindow != Window)
+	{
+		Window = NewWindow;
+		ValidTiles.Clip(Window);
+		if (ValidTiles.Area() <= 0)
+		{
+			ValidTiles = FIntRect();
+		}
+
+		PendingTiles.Reset();
+		for (int32 X = Window.Min.X; X < Window.Max.X; X++)
+		{
+			for (int32 Y = Window.Min.Y; Y < Window.Max.Y; Y++)
+			{
+				if (!ValidTiles.Contains(FIntPoint(X, Y)))
+				{
+					PendingTiles.Add(FIntPoint(X, Y));
+				}
+			}
+		}
+
+		// Popped from the back, so the tiles nearest the view go first
+		PendingTiles.Sort([ViewTile](const FIntPoint& A, const FIntPoint& B) { return (A - ViewTile).SizeSquared() > (B - ViewTile).SizeSquared(); });
+		PublishWindow();
+	}
+
+	if (PendingTiles.IsEmpty())
+	{
+		return;
+	}
+
+	HideMovableActors();
+	for (int32 Index = 0; Index < TilesPerTick && !PendingTiles.IsEmpty(); Index++)
+	{
+		CaptureTile(PendingTiles.Pop());
+	}
+	CaptureComponent->HiddenActors.Reset();
+
+	if (PendingTiles.IsEmpty())
+	{
+		ValidTiles = Window;
+		PublishWindow();
+	}
+}
+
+void AHeightFieldAOCapture::CaptureTile(const FIntPoint& Tile)
+{
+	TRACE_CPUPROFILER_EVENT_SCOPE(HeightFieldAOCapture::CaptureTile);
+
+	const double TileSize = WindowSize / TilesPerAxis;
+	const int32 TileResolution = TileTarget->SizeX;
+	const double Top = Bounds->Bounds.GetBox().Max.Z;
+
+	CaptureComponent->TextureTarget = TileTarget;
+	CaptureComponent->OrthoWidth = TileSize;
+	CaptureComponent->SetWorldLocationAndRotation(FVector((Tile.X + 0.5) * TileSize, (Tile.Y + 0.5) * TileSize, Top), FRotator(-90.f, 0.f, 0.f));
+	CaptureComponent->CaptureScene();
+
+	// The texture's U runs along +Y and V along -X, so a tile's column follows its Y and its row its -X, wrapped
+	const int32 Tiles = TilesPerAxis;
+	const auto Wrap = [Tiles](int32 Value) { return ((Value % Tiles) + Tiles) % Tiles; };
+	const FIntPoint WrappedTexel(Wrap(Tile.Y) * TileResolution, Wrap(-(Tile.X + 1)) * TileResolution);
+
+	FTextureRenderTargetResource* Source = TileTarget->GameThread_GetRenderTargetResource();
+	FTextureRenderTargetResource* Dest = HeightTarget->GameThread_GetRenderTargetResource();
+	ENQUEUE_RENDER_COMMAND(DEHeightFieldAOCopyTile)([Source, Dest, WrappedTexel, TileResolution](FRHICommandListImmediate& RHICmdList)
+	{
+		FRDGBuilder GraphBuilder(RHICmdList);
+		FRDGTextureRef SourceTexture = RegisterExternalTexture(GraphBuilder, Source->GetRenderTargetTexture(), TEXT("HeightFieldAOTile"));
+		FRDGTextureRef DestTexture = RegisterExternalTexture(GraphBuilder, Dest->GetRenderTargetTexture(), TEXT("HeightFieldAO"));
+
+		FRHICopyTextureInfo CopyInfo;
+		CopyInfo.Size = FIntVector(TileResolution, TileResolution, 1);
+		CopyInfo.DestPosition = FIntVector(WrappedTexel.X, WrappedTexel.Y, 0);
+		AddCopyTexturePass(GraphBuilder, SourceTexture, DestTexture, CopyInfo);
+		GraphBuilder.Execute();
+	});
+}
+
+void AHeightFieldAOCapture::PublishWindow()
+{
+	UWorld* World = GetWorld();
+	if (!World || !World->Scene)
+	{
+		return;
+	}
+
+	if (ValidTiles.Area() <= 0)
+	{
+		Clear();
+		return;
+	}
+
+	const double TileSize = WindowSize / TilesPerAxis;
+	const FBox2D Valid(FVector2D(ValidTiles.Min) * TileSize, FVector2D(ValidTiles.Max) * TileSize);
+	SetMobileHeightFieldAOWrapped(World->Scene, HeightTarget, WindowSize, Bounds->Bounds.GetBox().Max.Z, Valid);
 }
 
 void AHeightFieldAOCapture::Clear()

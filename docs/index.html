@@ -40,7 +40,8 @@ pre code { border: 0; padding: 0; background: none; }
 .card { background: var(--surface); border: 1px solid var(--line); border-radius: 6px; padding: 16px; display: grid; gap: 6px; align-content: start; }
 .card p { font-size: 15px; color: var(--muted); }
 figure { margin: 0; display: grid; gap: 6px; min-width: 0; }
-figure img, figure video { width: 100%; height: auto; display: block; border: 1px solid var(--line); background: var(--surface); }
+figure img, figure iframe { width: 100%; height: auto; display: block; border: 1px solid var(--line); background: var(--surface); }
+figure iframe { aspect-ratio: 16 / 9; }
 figure img.zoom { image-rendering: pixelated; }
 figcaption { font: 13px var(--mono); color: var(--muted); }
 .controls { display: flex; flex-wrap: wrap; gap: 6px; }
@@ -65,20 +66,6 @@ footer { color: var(--muted); font-size: 14px; }
 <body>
 <div class="wrap">
 
-  <header class="hero">
-    <h1>ForwardLevelUp</h1>
-    <p class="lede">Clean MSAA and proper ambient occlusion for Unreal Engine 5.8's mobile forward renderer, on PC and mobile hardware.</p>
-    <figure>
-      <img src="img/readme_hero.jpg" alt="No anti-aliasing on the left, ForwardLevelUp MSAA on the right" width="1450" height="445">
-    </figure>
-    <div class="actions">
-      <a class="btn primary" href="https://github.com/Vaei/ForwardLevelUp">Get it on GitHub</a>
-      <a class="btn" href="#compare">Compare</a>
-      <a class="btn" href="#start">Set it up</a>
-    </div>
-    <p class="fine">Engine patches for a UE 5.8 source build. Every feature is behind a console variable and does nothing until you turn it on.</p>
-  </header>
-
   <section>
     <h2>What you get</h2>
     <div class="cards">
@@ -88,16 +75,18 @@ footer { color: var(--muted); font-size: 14px; }
       <div class="card"><h3>Contact shadows</h3><p>Characters darken the ground under them, using the engine's capsule shadows.</p></div>
       <div class="card"><h3>Reflections</h3><p>Screen-space reflections work alongside MSAA.</p></div>
       <div class="card"><h3>World normals</h3><p>Post-process materials can read SceneTexture WorldNormal in forward.</p></div>
+      <div class="card"><h3>Decals in the base pass</h3><p>Decals change base colour, normal and roughness before lighting, so every light shades them, at every MSAA sample.</p></div>
+      <div class="card"><h3>Bounce light</h3><p>Coloured light bounced off the buildings and street around you, from the same height capture as the occlusion.</p></div>
+      <div class="card"><h3>Contact shadows for anything</h3><p>Vehicles and props darken the ground under them too, without distance fields.</p></div>
+      <div class="card"><h3>Clean soft particles</h3><p>Depth-faded particles stop leaving a halo around foreground edges.</p></div>
     </div>
   </section>
 
-  <section id="videos" hidden>
+  <section id="videos">
     <h2>In motion</h2>
     <p>Aliasing is worst in motion. The same gameplay before and after.</p>
-    <div class="pair">
-      <figure><video src="video/before.mp4" controls muted loop playsinline preload="metadata"></video><figcaption>Before</figcaption></figure>
-      <figure><video src="video/after.mp4" controls muted loop playsinline preload="metadata"></video><figcaption>After</figcaption></figure>
-    </div>
+    <br><p><i>NOTE: Video compression is quite aggressive here.</i></p>
+    <figure><iframe src="https://www.youtube-nocookie.com/embed/Wv0jJrZ6ruw" title="Before and after gameplay" allow="encrypted-media; picture-in-picture; fullscreen" allowfullscreen loading="lazy"></iframe></figure>
   </section>
 
   <section id="compare">
@@ -115,6 +104,9 @@ footer { color: var(--muted); font-size: 14px; }
     <figure><img src="img/extra_dfao.jpg" alt="Screen-space AO only on the left, plus distance-field AO on the right" width="1930" height="540" loading="lazy"><figcaption>Distance-field AO · left screen-space AO only, right with distance-field AO</figcaption></figure>
     <figure><img src="img/extra_hfao.jpg" alt="Without and with height-field AO" width="1930" height="540" loading="lazy"><figcaption>Occlusion from buildings · left off, right on. Sidewalks and walls next to tall buildings darken; open street does not</figcaption></figure>
     <figure><img src="img/extra_capsule.jpg" alt="A character's feet without and with a contact shadow" width="1130" height="520" loading="lazy"><figcaption>Character contact shadow · left off, right on</figcaption></figure>
+    <figure><img src="img/extra_decals.jpg" alt="The same three decals drawn by stock mobile forward and by clustered decals" width="1930" height="540" loading="lazy"><figcaption>Decals · left stock mobile forward, which drops their normals and roughness; right applied in the base pass</figcaption></figure>
+    <figure><img src="img/extra_gi.jpg" alt="Without and with height-field bounce light" width="1930" height="540" loading="lazy"><figcaption>Bounce light from buildings · left off, right on at 4x intensity so it shows at this size</figcaption></figure>
+    <figure><img src="img/extra_depthfade.jpg" alt="A head in front of a depth-faded translucent wall, stock and per-sample" width="1210" height="300" loading="lazy"><figcaption>Depth fade under MSAA · left stock, with a dark fringe where the wall fades against the foreground depth; right per-sample</figcaption></figure>
     <figure><img src="img/extra_normal.jpg" alt="A scene and its world normals read by a post-process material" width="1940" height="543" loading="lazy"><figcaption>World normals in forward · left the scene, right a post-process material reading WorldNormal</figcaption></figure>
   </section>
 
@@ -122,7 +114,7 @@ footer { color: var(--muted); font-size: 14px; }
     <h2>Set it up</h2>
     <p>You need a UE 5.8 source build, and a project on the mobile renderer: <code>bPreferFeatureLevelES31</code> on PC, or a mobile platform.</p>
     <ol>
-      <li>Download the repository and apply the eight patches in <code>Patches/</code> to the engine, in order, with <code>git apply</code>.</li>
+      <li>Download the repository and apply the fourteen patches in <code>Patches/</code> to the engine, in order, with <code>git apply</code>.</li>
       <li>Build the editor. The first launch recompiles every material.</li>
       <li>Add the settings below to <code>Config/DefaultEngine.ini</code> under <code>[/Script/Engine.RendererSettings]</code>, then restart the editor.</li>
     </ol>
@@ -134,7 +126,7 @@ r.Mobile.MSAA.EdgeAwareFetch=1
 r.Mobile.MSAA.SkipRedundantResolve=1
 r.Mobile.AmbientOcclusion=1
 r.DefaultFeature.AmbientOcclusion=True</code></pre>
-    <p>The <a href="https://github.com/Vaei/ForwardLevelUp#readme">README</a> covers the optional extras (distance-field AO, contact shadows, reflections, occlusion from buildings, world normals), what to check when something doesn't show up, and every setting.</p>
+    <p>The <a href="https://github.com/Vaei/ForwardLevelUp#readme">README</a> covers the optional extras (distance-field AO, contact shadows, reflections, occlusion and bounce light from buildings, decals, soft particles, world normals), what to check when something doesn't show up, and every setting.</p>
   </section>
 
   <section>
@@ -151,6 +143,8 @@ r.DefaultFeature.AmbientOcclusion=True</code></pre>
         <tr><td>Contact shadows (one character)</td><td class="num">0.026 ms</td></tr>
         <tr><td>Screen-space reflections</td><td class="num">~0 ms</td></tr>
         <tr><td>World normals</td><td class="num">~0.07 ms</td></tr>
+        <tr><td>Bounce light from buildings</td><td class="num">0.02 ms</td></tr>
+        <tr><td>Contact shadows for movables (12 casters)</td><td class="num">0.045 ms</td></tr>
       </tbody>
     </table></div>
   </section>
@@ -170,6 +164,12 @@ r.DefaultFeature.AmbientOcclusion=True</code></pre>
           <tr><td>6 Contact shadows and SSR fix</td><td>Capsule sky occlusion is disabled on mobile. Mobile SSR crashes with patch 4.</td><td>Capsule occlusion on mobile, optionally cast straight down (<code>r.CapsuleIndirectSkyLightFromAbove</code>). SSR safe under MSAA.</td></tr>
           <tr><td>7 World normals</td><td>Forward has no normal buffer, so post-process materials cannot read WorldNormal.</td><td>Optional normal target (<code>r.Mobile.Forward.NormalTarget</code>).</td></tr>
           <tr><td>8 Occlusion from buildings</td><td>Nothing occludes the sky beyond a few metres.</td><td>Sky occlusion from a top-down height capture of the level (<code>r.Mobile.HeightFieldAO</code>).</td></tr>
+          <tr><td>9 Tonemap subpass resolve</td><td>The on-chip tonemap subpass averages HDR samples, then tonemaps, so bright edges stair-step.</td><td>Weighted or per-sample tonemapped resolve (<code>r.Mobile.TonemapSubpass.Resolve</code>).</td></tr>
+          <tr><td>10 Per-sample depth fade</td><td>Translucency fades against the resolved foreground depth, leaving halos at edges.</td><td>Reads the MSAA sample behind the fragment (<code>r.Mobile.MSAA.PerSampleDepthFade</code>).</td></tr>
+          <tr><td>11 Primitive AO</td><td>Contact occlusion needs distance fields, and only characters cast it without them.</td><td>Capsules and bounds ellipsoids for any movable (<code>r.Mobile.PrimitiveAO</code>).</td></tr>
+          <tr><td>12 Height-field clipmap</td><td>One capture of the whole level.</td><td>A toroidal window that follows the camera, captured a few tiles per frame.</td></tr>
+          <tr><td>13 Height-field GI</td><td>No bounce light without baked lighting.</td><td>One bounce off the height field (<code>r.Mobile.HeightFieldGI</code>).</td></tr>
+          <tr><td>14 Clustered decals</td><td>Forward decals draw over scene colour with their own lighting, no normals or roughness, no local lights.</td><td>Baked into an atlas and applied in the base pass from screen tile lists (<code>r.Mobile.ClusteredDecals</code>).</td></tr>
         </tbody>
       </table></div>
     </details>
@@ -223,12 +223,6 @@ document.addEventListener("keydown", e => {
   if (i >= 0 && i < keys.length) { mode = keys[i]; render(); }
 });
 render();
-
-// The videos section appears once docs/video/before.mp4 exists
-const probe = document.createElement("video");
-probe.preload = "metadata";
-probe.addEventListener("loadedmetadata", () => { document.getElementById("videos").hidden = false; });
-probe.src = "video/before.mp4";
 </script>
 </body>
 </html>

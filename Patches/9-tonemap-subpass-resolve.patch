@@ -1,0 +1,89 @@
+diff --git a/Engine/Shaders/Private/PostProcessTonemap.usf b/Engine/Shaders/Private/PostProcessTonemap.usf
+index b73f03d0c09d..e3143a3ea999 100644
+--- a/Engine/Shaders/Private/PostProcessTonemap.usf
++++ b/Engine/Shaders/Private/PostProcessTonemap.usf
+@@ -673,6 +673,33 @@ void MainCS(uint2 DispatchThreadId : SV_DispatchThreadID)
+ 	#endif
+ #endif
+ 
++uint SubpassResolveMode;
++
++#if VULKAN_PROFILE && SUBPASS_MSAA_SAMPLES > 1
++/** Resolves the samples on chip in the tonemapped domain: weighted by inverse luminance (1), or tonemapped one by one (2). */
++half3 ResolveAndTonemapSubpassSamples(half3 Scale)
++{
++	half3 Sum = 0;
++	half WeightSum = 0;
++	UNROLL
++	for (int SampleIndex = 0; SampleIndex < SUBPASS_MSAA_SAMPLES; SampleIndex++)
++	{
++		const half3 Sample = half3(VulkanSubpassFetch0(SampleIndex).rgb) * Scale;
++		if (SubpassResolveMode == 2)
++		{
++			Sum += ColorLookupTable(Sample);
++		}
++		else
++		{
++			const half Weight = rcp(1.0 + Luminance(Sample));
++			Sum += Sample * Weight;
++			WeightSum += Weight;
++		}
++	}
++	return SubpassResolveMode == 2 ? Sum / SUBPASS_MSAA_SAMPLES : ColorLookupTable(Sum / WeightSum);
++}
++#endif
++
+ half4 FetchAndResolveSceneColor(float2 UV, float ArrayIndex)
+ {
+ 	half4 SceneColor = half4(1.0, 1.0, 1.0, 1.0);
+@@ -709,6 +736,14 @@ void MobileCustomResolve_MainPS(
+ 	
+ 	const float OneOverPreExposure = ResolvedView.OneOverPreExposure;
+ 
++#if VULKAN_PROFILE && SUBPASS_MSAA_SAMPLES > 1
++	if (SubpassResolveMode != 0)
++	{
++		OutColor = float4(ResolveAndTonemapSubpassSamples(half3(ColorScale0.rgb * OneOverPreExposure)), 1.0);
++		return;
++	}
++#endif
++
+ 	half4 SceneColor = FetchAndResolveSceneColor(UV, GetEyeIndex(StereoInput));
+ 	SceneColor.a = 1.0;
+ 
+diff --git a/Engine/Source/Runtime/Renderer/Private/PostProcess/PostProcessTonemap.cpp b/Engine/Source/Runtime/Renderer/Private/PostProcess/PostProcessTonemap.cpp
+index 2c8c5db24c0a..89598a8e374b 100644
+--- a/Engine/Source/Runtime/Renderer/Private/PostProcess/PostProcessTonemap.cpp
++++ b/Engine/Source/Runtime/Renderer/Private/PostProcess/PostProcessTonemap.cpp
+@@ -70,6 +70,15 @@ static TAutoConsoleVariable<int32> CVarBackbufferQuantizationDitheringOverride(
+ 	TEXT("Disabled by default. Instead is automatically found out by FSceneViewFamily::RenderTarget's pixel format of the backbuffer."),
+ 	ECVF_RenderThreadSafe);
+ 
++static TAutoConsoleVariable<int32> CVarMobileTonemapSubpassResolve(
++	TEXT("r.Mobile.TonemapSubpass.Resolve"),
++	0,
++	TEXT("How the mobile tonemap subpass resolves MSAA samples on chip.\n")
++	TEXT("0: box average of HDR samples, then tonemap (stock)\n")
++	TEXT("1: average weighted by inverse luminance, then tonemap. Bright edges against dark ones stop stair-stepping.\n")
++	TEXT("2: tonemap every sample, then average. Exact, one color grading lookup per sample."),
++	ECVF_Scalability | ECVF_RenderThreadSafe);
++
+ TAutoConsoleVariable<int32> CVarLUTShaper(
+ 	TEXT("r.LUT.Shaper"), 0,
+ 	TEXT("Which shaper to use for addressing the LUT\n")
+@@ -1162,6 +1171,7 @@ class FMobileCustomResolvePS : public FGlobalShader
+ 		SHADER_PARAMETER(float, LUTScale)
+ 		SHADER_PARAMETER(float, LUTOffset)
+ 		SHADER_PARAMETER(uint32, LUTShaper)
++		SHADER_PARAMETER(uint32, SubpassResolveMode)
+ 	END_SHADER_PARAMETER_STRUCT()
+ 
+ 	class FTonemapperSubpassMsaaDim : SHADER_PERMUTATION_SPARSE_INT("SUBPASS_MSAA_SAMPLES", 0, 1, 2, 4, 8);
+@@ -1210,6 +1220,7 @@ void RenderMobileCustomResolve(FRHICommandList& RHICmdList, const FViewInfo& Vie
+ 	PSShaderParameters.LUTScale = (LUTSize - 1.0f) / LUTSize;
+ 	PSShaderParameters.LUTOffset = 0.5f / LUTSize;
+ 	PSShaderParameters.LUTShaper = CVarLUTShaper.GetValueOnRenderThread();
++	PSShaderParameters.SubpassResolveMode = FMath::Clamp(CVarMobileTonemapSubpassResolve.GetValueOnRenderThread(), 0, 2);
+ 	if (SubpassMSAASamples == 0u)
+ 	{
+ 		PSShaderParameters.ColorTexture = SceneTextures.Color.Resolve;

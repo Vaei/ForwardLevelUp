@@ -1,0 +1,156 @@
+diff --git a/Engine/Shaders/Private/MobileBasePassPixelShader.usf b/Engine/Shaders/Private/MobileBasePassPixelShader.usf
+index ce69a3217151..3992fdb4a86f 100644
+--- a/Engine/Shaders/Private/MobileBasePassPixelShader.usf
++++ b/Engine/Shaders/Private/MobileBasePassPixelShader.usf
+@@ -401,6 +401,9 @@ void Main(
+ 
+ 	StereoSetupPS(StereoInput);
+ 	const uint EyeIndex = GetEyeIndex(StereoInput);
++#if MOBILE_TRANSLUCENT_MSAA_DEPTH
++	GMobileTranslucentFragmentDeviceZ = SvPosition.z;
++#endif
+ 
+ #if USE_GLOBAL_CLIP_PLANE && !PLATFORM_SUPPORTS_CLIP_DISTANCE
+ 	clip(BasePassInterpolants.OutClipDistance);
+diff --git a/Engine/Shaders/Private/SceneTexturesCommon.ush b/Engine/Shaders/Private/SceneTexturesCommon.ush
+index 56091dcb945b..bb0d0afe733f 100644
+--- a/Engine/Shaders/Private/SceneTexturesCommon.ush
++++ b/Engine/Shaders/Private/SceneTexturesCommon.ush
+@@ -204,9 +204,49 @@ float4 CalcFullSceneColor(float2 ScreenUV)
+ #endif
+ 
+ 
++#if MOBILE_TRANSLUCENT_MSAA_DEPTH
++/** DeviceZ of the translucent fragment being shaded, set by the mobile base pass before the material runs. */
++static float GMobileTranslucentFragmentDeviceZ = 0;
++
++/**
++ * The closest of the pixel's depth samples at or behind the translucent fragment. Samples in front of it fail the depth test
++ * and never receive it, so depth fades measure against the surfaces the fragment actually covers rather than the resolved
++ * foreground depth, which leaves a hard halo around foreground edges.
++ */
++bool LookupMobileTranslucentMSAADeviceZ(float2 ScreenUV, out float OutDeviceZ)
++{
++	OutDeviceZ = 0;
++	const uint NumSamples = MobileBasePass.MSAASceneDepthSamples;
++	if (NumSamples < 2)
++	{
++		return false;
++	}
++
++	const int2 Pixel = int2(ScreenUV * View.BufferSizeAndInvSize.xy);
++	float Closest = -1;
++	for (uint SampleIndex = 0; SampleIndex < NumSamples; SampleIndex++)
++	{
++		const float SampleDeviceZ = MobileBasePass.MSAASceneDepthTexture.Load(Pixel, SampleIndex).r;
++		if (SampleDeviceZ <= GMobileTranslucentFragmentDeviceZ && SampleDeviceZ > Closest)
++		{
++			Closest = SampleDeviceZ;
++		}
++	}
++	OutDeviceZ = Closest;
++	return Closest >= 0;
++}
++#endif
++
+ /** Returns DeviceZ which is the z value stored in the depth buffer. */
+ float LookupDeviceZ( float2 ScreenUV, float ArrayIndex )
+ {
++#if MOBILE_TRANSLUCENT_MSAA_DEPTH
++	float MSAADeviceZ;
++	if (LookupMobileTranslucentMSAADeviceZ(ScreenUV, MSAADeviceZ))
++	{
++		return MSAADeviceZ;
++	}
++#endif
+ #if	SCENE_TEXTURES_DISABLED
+ 	return SCENE_TEXTURES_DISABLED_SCENE_DEPTH_VALUE;
+ #elif FORCE_DEPTH_TEXTURE_READS || PLATFORM_NEEDS_DEPTH_TEXTURE_READS
+diff --git a/Engine/Source/Runtime/Renderer/Private/MobileBasePassRendering.cpp b/Engine/Source/Runtime/Renderer/Private/MobileBasePassRendering.cpp
+index 3837697000cb..f75263250c70 100644
+--- a/Engine/Source/Runtime/Renderer/Private/MobileBasePassRendering.cpp
++++ b/Engine/Source/Runtime/Renderer/Private/MobileBasePassRendering.cpp
+@@ -96,6 +96,41 @@ static TAutoConsoleVariable<int32> CVarMobileEnableCapsuleDirectShadows(
+ 	ECVF_ReadOnly | ECVF_RenderThreadSafe);
+ 
+ 
++static TAutoConsoleVariable<int32> CVarMobileMSAAPerSampleDepthFade(
++	TEXT("r.Mobile.MSAA.PerSampleDepthFade"),
++	0,
++	TEXT("With MSAA, translucent materials read scene depth (depth fade, soft particles) from the closest MSAA sample behind the fragment instead of the resolved foreground depth, so particles stop leaving a halo around foreground edges. Multi-pass forward only (PC); recompiles translucent materials.\n")
++	TEXT("0: off (stock)\n")
++	TEXT("1: on"),
++	ECVF_ReadOnly | ECVF_RenderThreadSafe);
++
++/** A 1x1 multisampled texture bound when the translucent base pass has no MSAA depth to read. */
++class FMobileMSAADepthDummy : public FRenderResource
++{
++public:
++	TRefCountPtr<IPooledRenderTarget> Texture;
++
++	FRDGTextureRef Get(FRDGBuilder& GraphBuilder)
++	{
++		if (!Texture)
++		{
++			const FRDGTextureDesc Desc = FRDGTextureDesc::Create2D(FIntPoint(1, 1), PF_R32_FLOAT, FClearValueBinding::Black, TexCreate_ShaderResource | TexCreate_RenderTargetable, 1, 2);
++			FRDGTextureRef Dummy = GraphBuilder.CreateTexture(Desc, TEXT("MobileMSAADepthDummy"));
++			AddClearRenderTargetPass(GraphBuilder, Dummy);
++			Texture = GraphBuilder.ConvertToExternalTexture(Dummy);
++			return Dummy;
++		}
++		return GraphBuilder.RegisterExternalTexture(Texture);
++	}
++
++	virtual void ReleaseRHI() override
++	{
++		Texture.SafeRelease();
++	}
++};
++
++static TGlobalResource<FMobileMSAADepthDummy> GMobileMSAADepthDummy;
++
+ static TAutoConsoleVariable<int32> CVarMobileMSAAEdgeAwareFetch(
+ 	TEXT("r.Mobile.MSAA.EdgeAwareFetch"),
+ 	0,
+@@ -254,6 +289,9 @@ void MobileBasePassModifyCompilationEnvironment(const FMaterialShaderPermutation
+ 	// translucency is in the same subpass with deferred shading shaders, so it has access to GBuffer
+ 	const bool bDeferredShadingSubpass = (bDeferredShadingEnabled && bTranslucentMaterial && !Parameters.MaterialParameters.bIsMobileSeparateTranslucencyEnabled);
+ 	OutEnvironment.SetDefine(TEXT("IS_MOBILE_DEFERREDSHADING_SUBPASS"), bDeferredShadingSubpass ? 1u : 0u);
++
++	const bool bTranslucentMSAADepth = bTranslucentMaterial && !bDeferredShadingEnabled && CVarMobileMSAAPerSampleDepthFade.GetValueOnAnyThread() != 0;
++	OutEnvironment.SetDefine(TEXT("MOBILE_TRANSLUCENT_MSAA_DEPTH"), bTranslucentMSAADepth ? 1u : 0u);
+ }
+ 
+ template<typename LightMapPolicyType>
+@@ -356,6 +394,18 @@ void SetupMobileBasePassUniformParameters(
+ 	BasePassParameters.bMSAAEdgeAwareFetch = bMSAAEdgeAwareFetch ? 1 : 0;
+ 	BasePassParameters.MSAAEdgeDepthThreshold = FMath::Max(CVarMobileMSAAEdgeDepthThreshold.GetValueOnRenderThread(), 0.0f);
+ 
++	// Only the multi-pass translucency pass has the MSAA depth readable: it binds depth read-only and it is not memoryless
++	const bool bMSAASceneDepth = CVarMobileMSAAPerSampleDepthFade.GetValueOnRenderThread() != 0
++		&& BasePass == EMobileBasePass::Translucent
++		&& EnumHasAnyFlags(SetupMode, EMobileSceneTextureSetupMode::SceneDepth)
++		&& SceneTextures
++		&& SceneTextures->Depth.IsSeparate()
++		&& SceneTextures->Depth.Target->Desc.NumSamples > 1
++		&& !EnumHasAnyFlags(SceneTextures->Depth.Target->Desc.Flags, TexCreate_Memoryless)
++		&& HasBeenProduced(SceneTextures->Depth.Target);
++	BasePassParameters.MSAASceneDepthTexture = bMSAASceneDepth ? SceneTextures->Depth.Target : GMobileMSAADepthDummy.Get(GraphBuilder);
++	BasePassParameters.MSAASceneDepthSamples = bMSAASceneDepth ? SceneTextures->Depth.Target->Desc.NumSamples : 0;
++
+ 	// Substrate
+ 	Substrate::BindSubstrateMobileForwardPasslUniformParameters(GraphBuilder, View, BasePassParameters.Substrate);
+ 
+diff --git a/Engine/Source/Runtime/Renderer/Private/MobileBasePassRendering.h b/Engine/Source/Runtime/Renderer/Private/MobileBasePassRendering.h
+index c556beeb2827..eb13f9d90f85 100644
+--- a/Engine/Source/Runtime/Renderer/Private/MobileBasePassRendering.h
++++ b/Engine/Source/Runtime/Renderer/Private/MobileBasePassRendering.h
+@@ -61,6 +61,8 @@ BEGIN_GLOBAL_SHADER_PARAMETER_STRUCT(FMobileBasePassUniformParameters, )
+ 	SHADER_PARAMETER_RDG_TEXTURE(Texture2D, MSAAResolvedDepthTexture)
+ 	SHADER_PARAMETER(uint32, bMSAAEdgeAwareFetch)
+ 	SHADER_PARAMETER(float, MSAAEdgeDepthThreshold)
++	SHADER_PARAMETER_RDG_TEXTURE(Texture2DMS<float>, MSAASceneDepthTexture)
++	SHADER_PARAMETER(uint32, MSAASceneDepthSamples)
+ 	SHADER_PARAMETER(uint32, bApplyHalfResLocalFogToSkyMeshes)
+ 	SHADER_PARAMETER_RDG_TEXTURE(Texture2D, HalfResLocalFogVolumeViewTexture)
+ 	SHADER_PARAMETER_SAMPLER(SamplerState, HalfResLocalFogVolumeViewSampler)

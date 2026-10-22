@@ -1,0 +1,551 @@
+diff --git a/Engine/Shaders/Private/MobileAOReconstruction.ush b/Engine/Shaders/Private/MobileAOReconstruction.ush
+new file mode 100644
+index 000000000000..f4d986b4be77
+--- /dev/null
++++ b/Engine/Shaders/Private/MobileAOReconstruction.ush
+@@ -0,0 +1,26 @@
++// Copyright (c) 2026 Jared Taylor.
++
++#pragma once
++
++Texture2D SceneDepthTexture;
++
++float3 PixelToTranslatedWorld(int2 Pixel)
++{
++	const float DeviceZ = SceneDepthTexture.Load(int3(Pixel, 0)).r;
++	const float4 Position = mul(float4(Pixel + 0.5, DeviceZ, 1), View.SVPositionToTranslatedWorld);
++	return Position.xyz / Position.w;
++}
++
++/** Each axis uses the neighbour with the smaller step, so silhouettes do not bend the normal. */
++float3 ReconstructNormal(int2 Pixel, float3 Center)
++{
++	const float3 Left = PixelToTranslatedWorld(Pixel - int2(1, 0));
++	const float3 Right = PixelToTranslatedWorld(Pixel + int2(1, 0));
++	const float3 Up = PixelToTranslatedWorld(Pixel - int2(0, 1));
++	const float3 Down = PixelToTranslatedWorld(Pixel + int2(0, 1));
++
++	const float3 TangentX = length2(Right - Center) < length2(Center - Left) ? Right - Center : Center - Left;
++	const float3 TangentY = length2(Down - Center) < length2(Center - Up) ? Down - Center : Center - Up;
++	const float3 Normal = normalize(cross(TangentY, TangentX));
++	return dot(Normal, Center - View.TranslatedWorldCameraOrigin) > 0 ? -Normal : Normal;
++}
+diff --git a/Engine/Shaders/Private/MobileHeightFieldAO.usf b/Engine/Shaders/Private/MobileHeightFieldAO.usf
+index 914f7860cd86..789d361f4780 100644
+--- a/Engine/Shaders/Private/MobileHeightFieldAO.usf
++++ b/Engine/Shaders/Private/MobileHeightFieldAO.usf
+@@ -1,8 +1,8 @@
+ // Copyright (c) 2026 Jared Taylor.
+ 
+ #include "Common.ush"
++#include "MobileAOReconstruction.ush"
+ 
+-Texture2D SceneDepthTexture;
+ Texture2D HeightTexture;
+ SamplerState HeightSampler;
+ float4 HeightUVScaleBias;
+@@ -25,27 +25,6 @@ float SampleHeight(float2 TranslatedWorldXY)
+ 	return HeightTop - HeightTexture.SampleLevel(HeightSampler, GetHeightUV(TranslatedWorldXY), 0).a;
+ }
+ 
+-float3 PixelToTranslatedWorld(int2 Pixel)
+-{
+-	const float DeviceZ = SceneDepthTexture.Load(int3(Pixel, 0)).r;
+-	const float4 Position = mul(float4(Pixel + 0.5, DeviceZ, 1), View.SVPositionToTranslatedWorld);
+-	return Position.xyz / Position.w;
+-}
+-
+-/** Each axis uses the neighbour with the smaller step, so silhouettes do not bend the normal. */
+-float3 ReconstructNormal(int2 Pixel, float3 Center)
+-{
+-	const float3 Left = PixelToTranslatedWorld(Pixel - int2(1, 0));
+-	const float3 Right = PixelToTranslatedWorld(Pixel + int2(1, 0));
+-	const float3 Up = PixelToTranslatedWorld(Pixel - int2(0, 1));
+-	const float3 Down = PixelToTranslatedWorld(Pixel + int2(0, 1));
+-
+-	const float3 TangentX = length2(Right - Center) < length2(Center - Left) ? Right - Center : Center - Left;
+-	const float3 TangentY = length2(Down - Center) < length2(Center - Up) ? Down - Center : Center - Up;
+-	const float3 Normal = normalize(cross(TangentY, TangentX));
+-	return dot(Normal, Center - View.TranslatedWorldCameraOrigin) > 0 ? -Normal : Normal;
+-}
+-
+ void MainPS(float4 SvPosition : SV_POSITION, out float4 OutColor : SV_Target0)
+ {
+ 	const int2 Pixel = int2(SvPosition.xy);
+diff --git a/Engine/Shaders/Private/MobilePrimitiveAO.usf b/Engine/Shaders/Private/MobilePrimitiveAO.usf
+new file mode 100644
+index 000000000000..0c1a55ed0c1c
+--- /dev/null
++++ b/Engine/Shaders/Private/MobilePrimitiveAO.usf
+@@ -0,0 +1,85 @@
++// Copyright (c) 2026 Jared Taylor.
++
++#include "Common.ush"
++#include "MobileAOReconstruction.ush"
++
++StructuredBuffer<float4> Shapes;
++float MaxDistance;
++float Intensity;
++
++void MainVS(
++	float4 InPosition : ATTRIBUTE0,
++	float4 InPrimitive : ATTRIBUTE1,
++	out nointerpolation float4 OutPrimitive : TEXCOORD0,
++	out float4 OutPosition : SV_POSITION)
++{
++	OutPosition = mul(float4(InPosition.xyz, 1), View.TranslatedWorldToClip);
++	OutPrimitive = InPrimitive;
++}
++
++/** Cosine-weighted share of the hemisphere above the surface that a sphere covers, fading out MaxDistance past its surface. */
++float SphereOcclusion(float3 ToCenter, float3 Normal, float Radius, float SurfaceDistance)
++{
++	const float Distance = max(length(ToCenter), Radius);
++	const float Cosine = saturate(dot(Normal, ToCenter) / Distance);
++	const float Fade = saturate(1 - SurfaceDistance / MaxDistance);
++	return saturate(Cosine * Square(Radius / Distance)) * Fade * Fade;
++}
++
++float CapsuleOcclusion(float3 Position, float3 Normal, float3 A, float3 B, float Radius)
++{
++	const float3 Axis = B - A;
++	const float T = saturate(dot(Position - A, Axis) / max(dot(Axis, Axis), 1e-4));
++	const float3 ToCenter = A + Axis * T - Position;
++	return SphereOcclusion(ToCenter, Normal, Radius, max(length(ToCenter) - Radius, 0));
++}
++
++/** The ellipsoid is scaled to a unit sphere, which moves the receiver and bends its normal with it. */
++float EllipsoidOcclusion(float3 Position, float3 Normal, float3 Center, float4 AxisX, float4 AxisY, float4 AxisZ)
++{
++	const float3 Offset = Position - Center;
++	const float3 UnitPosition = float3(dot(Offset, AxisX.xyz), dot(Offset, AxisY.xyz), dot(Offset, AxisZ.xyz));
++	const float3 UnitNormal = normalize(float3(dot(Normal, AxisX.xyz) * Square(AxisX.w), dot(Normal, AxisY.xyz) * Square(AxisY.w), dot(Normal, AxisZ.xyz) * Square(AxisZ.w)));
++	const float UnitDistance = length(UnitPosition);
++	// Surface distance in world units along the receiver's direction from the centre
++	const float SurfaceDistance = max(UnitDistance - 1, 0) * length(Offset) / max(UnitDistance, 1e-4);
++	return SphereOcclusion(-UnitPosition, UnitNormal, 1, SurfaceDistance);
++}
++
++void MainPS(
++	nointerpolation float4 Primitive : TEXCOORD0,
++	float4 SvPosition : SV_POSITION,
++	out float4 OutColor : SV_Target0)
++{
++	const int2 Pixel = int2(SvPosition.xy);
++	if (SceneDepthTexture.Load(int3(Pixel, 0)).r == FarDepthValue)
++	{
++		OutColor = 1;
++		return;
++	}
++
++	const float3 Position = PixelToTranslatedWorld(Pixel);
++	const float3 Normal = ReconstructNormal(Pixel, Position);
++
++	const uint FirstShape = (uint)Primitive.x;
++	const uint NumShapes = (uint)Primitive.y;
++	float Visibility = 1;
++	for (uint ShapeIndex = FirstShape; ShapeIndex < FirstShape + NumShapes; ShapeIndex++)
++	{
++		const float4 Shape0 = Shapes[ShapeIndex * 4 + 0];
++		const float4 Shape1 = Shapes[ShapeIndex * 4 + 1];
++		float Occlusion;
++		if (Shape0.w < 0.5)
++		{
++			Occlusion = CapsuleOcclusion(Position, Normal, Shape0.xyz, Shape1.xyz, Shape1.w);
++		}
++		else
++		{
++			Occlusion = EllipsoidOcclusion(Position, Normal, Shape0.xyz, Shape1, Shapes[ShapeIndex * 4 + 2], Shapes[ShapeIndex * 4 + 3]);
++		}
++		Visibility *= 1 - Occlusion;
++	}
++
++	Visibility = max(Visibility, Primitive.z);
++	OutColor = float4(lerp(1, Visibility, Intensity), 0, 0, 0);
++}
+diff --git a/Engine/Source/Runtime/Renderer/Private/MobilePrimitiveAO.cpp b/Engine/Source/Runtime/Renderer/Private/MobilePrimitiveAO.cpp
+new file mode 100644
+index 000000000000..dd07ba30ec48
+--- /dev/null
++++ b/Engine/Source/Runtime/Renderer/Private/MobilePrimitiveAO.cpp
+@@ -0,0 +1,330 @@
++// Copyright (c) 2026 Jared Taylor.
++
++#include "MobilePrimitiveAORendering.h"
++#include "PipelineStateCache.h"
++#include "PrimitiveSceneInfo.h"
++#include "ProfilingDebugging/CpuProfilerTrace.h"
++#include "RenderGraphUtils.h"
++#include "RenderUtils.h"
++#include "ScenePrivate.h"
++#include "SceneRendering.h"
++
++static TAutoConsoleVariable<int32> CVarMobilePrimitiveAO(
++	TEXT("r.Mobile.PrimitiveAO"),
++	0,
++	TEXT("Analytic sky occlusion under movable primitives, multiplied into mobile ambient occlusion with no distance fields. Skeletal meshes with Cast Capsule Indirect Shadow occlude with their shadow capsules, ")
++	TEXT("movable static meshes with Cast Distance Field Indirect Shadow with an ellipsoid fitted to their bounds. Needs r.Mobile.AmbientOcclusion."),
++	ECVF_Scalability | ECVF_RenderThreadSafe);
++
++static TAutoConsoleVariable<float> CVarMobilePrimitiveAOMaxDistance(
++	TEXT("r.Mobile.PrimitiveAO.MaxDistance"),
++	100.0f,
++	TEXT("World distance from a shape's surface at which its occlusion has faded to nothing."),
++	ECVF_Scalability | ECVF_RenderThreadSafe);
++
++static TAutoConsoleVariable<float> CVarMobilePrimitiveAOIntensity(
++	TEXT("r.Mobile.PrimitiveAO.Intensity"),
++	1.0f,
++	TEXT("0 disables the occlusion, 1 applies it fully."),
++	ECVF_Scalability | ECVF_RenderThreadSafe);
++
++static TAutoConsoleVariable<float> CVarMobilePrimitiveAOEllipsoidScale(
++	TEXT("r.Mobile.PrimitiveAO.EllipsoidScale"),
++	1.2f,
++	TEXT("Size of the ellipsoid fitted to a static mesh's local bounds, relative to the box. 1 touches the box's faces; 1.24 has the box's volume."),
++	ECVF_Scalability | ECVF_RenderThreadSafe);
++
++static TAutoConsoleVariable<int32> CVarMobilePrimitiveAOMaxPrimitives(
++	TEXT("r.Mobile.PrimitiveAO.MaxPrimitives"),
++	256,
++	TEXT("Most primitives that occlude in one view. The closest to the camera win."),
++	ECVF_Scalability | ECVF_RenderThreadSafe);
++
++DECLARE_GPU_STAT_NAMED(MobilePrimitiveAO, TEXT("Primitive AO"));
++
++namespace MobilePrimitiveAO
++{
++	/** One corner of a primitive's influence box: position, then (first shape, shape count, min visibility). */
++	struct FVertex
++	{
++		FVector4f Position;
++		FVector4f Primitive;
++	};
++
++	/** Four float4 per shape. A capsule: (A, 0), (B, radius). An ellipsoid: (centre, 1), then each axis divided by its radius, with the radius in w. */
++	constexpr int32 Float4PerShape = 4;
++}
++
++class FMobilePrimitiveAOVertexDeclaration : public FRenderResource
++{
++public:
++	FVertexDeclarationRHIRef VertexDeclarationRHI;
++
++	virtual void InitRHI(FRHICommandListBase& RHICmdList) override
++	{
++		FVertexDeclarationElementList Elements;
++		const uint16 Stride = sizeof(MobilePrimitiveAO::FVertex);
++		Elements.Add(FVertexElement(0, STRUCT_OFFSET(MobilePrimitiveAO::FVertex, Position), VET_Float4, 0, Stride));
++		Elements.Add(FVertexElement(0, STRUCT_OFFSET(MobilePrimitiveAO::FVertex, Primitive), VET_Float4, 1, Stride));
++		VertexDeclarationRHI = PipelineStateCache::GetOrCreateVertexDeclaration(Elements);
++	}
++
++	virtual void ReleaseRHI() override
++	{
++		VertexDeclarationRHI.SafeRelease();
++	}
++};
++
++static TGlobalResource<FMobilePrimitiveAOVertexDeclaration> GMobilePrimitiveAOVertexDeclaration;
++
++class FMobilePrimitiveAOVS : public FGlobalShader
++{
++public:
++	DECLARE_GLOBAL_SHADER(FMobilePrimitiveAOVS);
++	SHADER_USE_PARAMETER_STRUCT(FMobilePrimitiveAOVS, FGlobalShader);
++
++	BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
++		SHADER_PARAMETER_STRUCT_REF(FViewUniformShaderParameters, View)
++	END_SHADER_PARAMETER_STRUCT()
++
++	static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters& Parameters)
++	{
++		return IsMobilePlatform(Parameters.Platform);
++	}
++};
++
++class FMobilePrimitiveAOPS : public FGlobalShader
++{
++public:
++	DECLARE_GLOBAL_SHADER(FMobilePrimitiveAOPS);
++	SHADER_USE_PARAMETER_STRUCT(FMobilePrimitiveAOPS, FGlobalShader);
++
++	BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
++		SHADER_PARAMETER_STRUCT_REF(FViewUniformShaderParameters, View)
++		SHADER_PARAMETER_RDG_TEXTURE(Texture2D, SceneDepthTexture)
++		SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<float4>, Shapes)
++		SHADER_PARAMETER(float, MaxDistance)
++		SHADER_PARAMETER(float, Intensity)
++	END_SHADER_PARAMETER_STRUCT()
++
++	static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters& Parameters)
++	{
++		return IsMobilePlatform(Parameters.Platform);
++	}
++};
++
++IMPLEMENT_GLOBAL_SHADER(FMobilePrimitiveAOVS, "/Engine/Private/MobilePrimitiveAO.usf", "MainVS", SF_Vertex);
++IMPLEMENT_GLOBAL_SHADER(FMobilePrimitiveAOPS, "/Engine/Private/MobilePrimitiveAO.usf", "MainPS", SF_Pixel);
++
++BEGIN_SHADER_PARAMETER_STRUCT(FMobilePrimitiveAOPassParameters, )
++	SHADER_PARAMETER_STRUCT_INCLUDE(FMobilePrimitiveAOVS::FParameters, VS)
++	SHADER_PARAMETER_STRUCT_INCLUDE(FMobilePrimitiveAOPS::FParameters, PS)
++	RDG_BUFFER_ACCESS(Vertices, ERHIAccess::VertexOrIndexBuffer)
++	RENDER_TARGET_BINDING_SLOTS()
++END_SHADER_PARAMETER_STRUCT()
++
++namespace MobilePrimitiveAO
++{
++	struct FCaster
++	{
++		const FPrimitiveSceneInfo* PrimitiveSceneInfo;
++		double DistanceSquared;
++	};
++
++	/** Appends the primitive's occluding shapes in translated world space and returns their bounds, or an invalid box if it has none. */
++	static FBox AddShapes(const FPrimitiveSceneProxy* Proxy, const FVector& PreViewTranslation, float EllipsoidScale, TArray<FVector4f>& OutShapes, TArray<FCapsuleShape3f>& Capsules)
++	{
++		FBox Bounds(ForceInit);
++
++		Capsules.Reset();
++		Proxy->GetShadowShapes(PreViewTranslation, Capsules);
++		for (const FCapsuleShape3f& Capsule : Capsules)
++		{
++			const FVector3f HalfAxis = Capsule.Orientation * (0.5f * Capsule.Length);
++			const FVector3f A = Capsule.Center - HalfAxis;
++			const FVector3f B = Capsule.Center + HalfAxis;
++			OutShapes.Add(FVector4f(A, 0.0f));
++			OutShapes.Add(FVector4f(B, Capsule.Radius));
++			OutShapes.Add(FVector4f(0.0f));
++			OutShapes.Add(FVector4f(0.0f));
++
++			const FVector3f Radius(Capsule.Radius);
++			Bounds += FBox(FVector(FVector3f::Min(A, B) - Radius), FVector(FVector3f::Max(A, B) + Radius));
++		}
++
++		if (Capsules.Num() > 0)
++		{
++			return Bounds;
++		}
++
++		const FBoxSphereBounds LocalBounds = Proxy->GetLocalBounds();
++		const FMatrix& LocalToWorld = Proxy->GetLocalToWorld();
++		const FVector Center = LocalToWorld.TransformPosition(LocalBounds.Origin) + PreViewTranslation;
++		OutShapes.Add(FVector4f(FVector3f(Center), 1.0f));
++
++		FVector Extent = FVector::ZeroVector;
++		for (int32 Axis = 0; Axis < 3; Axis++)
++		{
++			FVector Local = FVector::ZeroVector;
++			Local[Axis] = FMath::Max(LocalBounds.BoxExtent[Axis], 1.0) * EllipsoidScale;
++			const FVector World = LocalToWorld.TransformVector(Local);
++			const double Radius = FMath::Max(World.Size(), 1.0);
++			OutShapes.Add(FVector4f(FVector3f(World / (Radius * Radius)), (float)Radius));
++			Extent += World.GetAbs();
++		}
++		return FBox(Center - Extent, Center + Extent);
++	}
++
++	template<typename AllocatorType>
++	static void AddBox(const FBox& Box, const FVector4f& Primitive, TArray<FVertex, AllocatorType>& OutVertices)
++	{
++		FVector4f Corners[8];
++		for (uint32 Z = 0; Z < 2; Z++)
++		{
++			for (uint32 Y = 0; Y < 2; Y++)
++			{
++				for (uint32 X = 0; X < 2; X++)
++				{
++					Corners[GetCubeVertexIndex(X, Y, Z)] = FVector4f(
++						(float)(X ? Box.Min.X : Box.Max.X),
++						(float)(Y ? Box.Min.Y : Box.Max.Y),
++						(float)(Z ? Box.Min.Z : Box.Max.Z),
++						1.0f);
++				}
++			}
++		}
++
++		for (const uint16 Index : GCubeIndices)
++		{
++			OutVertices.Add({ Corners[Index], Primitive });
++		}
++	}
++}
++
++bool ShouldRenderMobilePrimitiveAO(const FScene* Scene)
++{
++	return Scene && CVarMobilePrimitiveAO.GetValueOnRenderThread() != 0 && CVarMobilePrimitiveAOIntensity.GetValueOnRenderThread() > 0.0f && Scene->DynamicIndirectCasterPrimitives.Num() > 0;
++}
++
++void RenderMobilePrimitiveAO(FRDGBuilder& GraphBuilder, const FScene* Scene, TArrayView<const FViewInfo> Views, FRDGTexture* SceneDepth, FRDGTexture* AmbientOcclusion)
++{
++	TRACE_CPUPROFILER_EVENT_SCOPE(MobilePrimitiveAO::RenderMobilePrimitiveAO);
++
++	if (!ShouldRenderMobilePrimitiveAO(Scene) || !SceneDepth || !AmbientOcclusion)
++	{
++		return;
++	}
++
++	RDG_EVENT_SCOPE_STAT(GraphBuilder, MobilePrimitiveAO, "MobilePrimitiveAO");
++
++	const float MaxDistance = FMath::Max(CVarMobilePrimitiveAOMaxDistance.GetValueOnRenderThread(), 1.0f);
++	const float EllipsoidScale = FMath::Max(CVarMobilePrimitiveAOEllipsoidScale.GetValueOnRenderThread(), 0.1f);
++	const int32 MaxPrimitives = FMath::Max(CVarMobilePrimitiveAOMaxPrimitives.GetValueOnRenderThread(), 1);
++
++	for (const FViewInfo& View : Views)
++	{
++		if (View.bIsSceneCapture || View.bIsReflectionCapture || View.bIsPlanarReflection || !View.Family->EngineShowFlags.AmbientOcclusion)
++		{
++			continue;
++		}
++
++		TArray<MobilePrimitiveAO::FCaster, SceneRenderingAllocator> Casters;
++		for (const FPrimitiveSceneInfo* PrimitiveSceneInfo : Scene->DynamicIndirectCasterPrimitives)
++		{
++			const FPrimitiveSceneProxy* Proxy = PrimitiveSceneInfo->Proxy;
++			// One ellipsoid cannot stand for a whole set of instances
++			if (!Proxy->CastsDynamicShadow() || !Proxy->CastsDynamicIndirectShadow() || PrimitiveSceneInfo->GetNumInstanceSceneDataEntries() > 1)
++			{
++				continue;
++			}
++
++			const FBoxSphereBounds& Bounds = Proxy->GetBounds();
++			if (View.ViewFrustum.IntersectBox(Bounds.Origin, Bounds.BoxExtent + FVector(MaxDistance)))
++			{
++				Casters.Add({ PrimitiveSceneInfo, FVector::DistSquared(Bounds.Origin, View.ViewMatrices.GetViewOrigin()) });
++			}
++		}
++
++		if (Casters.IsEmpty())
++		{
++			continue;
++		}
++
++		if (Casters.Num() > MaxPrimitives)
++		{
++			Casters.Sort([](const MobilePrimitiveAO::FCaster& A, const MobilePrimitiveAO::FCaster& B) { return A.DistanceSquared < B.DistanceSquared; });
++			Casters.SetNum(MaxPrimitives);
++		}
++
++		const FVector PreViewTranslation = View.ViewMatrices.GetPreViewTranslation();
++		TArray<FVector4f, SceneRenderingAllocator> Shapes;
++		TArray<MobilePrimitiveAO::FVertex, SceneRenderingAllocator> Vertices;
++		TArray<FCapsuleShape3f> Capsules;
++		Vertices.Reserve(Casters.Num() * UE_ARRAY_COUNT(GCubeIndices));
++
++		for (const MobilePrimitiveAO::FCaster& Caster : Casters)
++		{
++			const FPrimitiveSceneProxy* Proxy = Caster.PrimitiveSceneInfo->Proxy;
++			const int32 FirstShape = Shapes.Num() / MobilePrimitiveAO::Float4PerShape;
++			TArray<FVector4f> PrimitiveShapes;
++			const FBox ShapeBounds = MobilePrimitiveAO::AddShapes(Proxy, PreViewTranslation, EllipsoidScale, PrimitiveShapes, Capsules);
++			if (!ShapeBounds.IsValid)
++			{
++				continue;
++			}
++			Shapes.Append(PrimitiveShapes);
++
++			const int32 NumShapes = PrimitiveShapes.Num() / MobilePrimitiveAO::Float4PerShape;
++			const FVector4f Primitive((float)FirstShape, (float)NumShapes, Proxy->GetDynamicIndirectShadowMinVisibility(), 0.0f);
++			MobilePrimitiveAO::AddBox(ShapeBounds.ExpandBy(MaxDistance), Primitive, Vertices);
++		}
++
++		if (Vertices.IsEmpty())
++		{
++			continue;
++		}
++
++		FMobilePrimitiveAOPassParameters* PassParameters = GraphBuilder.AllocParameters<FMobilePrimitiveAOPassParameters>();
++		PassParameters->VS.View = View.ViewUniformBuffer;
++		PassParameters->PS.View = View.ViewUniformBuffer;
++		PassParameters->PS.SceneDepthTexture = SceneDepth;
++		PassParameters->PS.Shapes = GraphBuilder.CreateSRV(CreateStructuredBuffer(GraphBuilder, TEXT("MobilePrimitiveAO.Shapes"), TConstArrayView<FVector4f>(Shapes)));
++		PassParameters->PS.MaxDistance = MaxDistance;
++		PassParameters->PS.Intensity = FMath::Min(CVarMobilePrimitiveAOIntensity.GetValueOnRenderThread(), 1.0f);
++		PassParameters->Vertices = CreateVertexBuffer(GraphBuilder, TEXT("MobilePrimitiveAO.Vertices"), FRDGBufferDesc::CreateBufferDesc(sizeof(MobilePrimitiveAO::FVertex), Vertices.Num()), Vertices.GetData(), Vertices.Num() * sizeof(MobilePrimitiveAO::FVertex));
++		PassParameters->RenderTargets[0] = FRenderTargetBinding(AmbientOcclusion, ERenderTargetLoadAction::ELoad);
++
++		TShaderMapRef<FMobilePrimitiveAOVS> VertexShader(View.ShaderMap);
++		TShaderMapRef<FMobilePrimitiveAOPS> PixelShader(View.ShaderMap);
++		const FIntRect ViewRect = View.ViewRect;
++		const uint32 NumTriangles = Vertices.Num() / 3;
++		// Back faces only, so each pixel inside a box's footprint is shaded once even with the camera inside the box
++		FRHIRasterizerState* RasterizerState = View.bReverseCulling ? TStaticRasterizerState<FM_Solid, CM_CCW>::GetRHI() : TStaticRasterizerState<FM_Solid, CM_CW>::GetRHI();
++
++		GraphBuilder.AddPass(
++			RDG_EVENT_NAME("PrimitiveAO %d primitives", Casters.Num()),
++			PassParameters,
++			ERDGPassFlags::Raster,
++			[PassParameters, VertexShader, PixelShader, ViewRect, NumTriangles, RasterizerState](FRHICommandList& RHICmdList)
++			{
++				RHICmdList.SetViewport(ViewRect.Min.X, ViewRect.Min.Y, 0.0f, ViewRect.Max.X, ViewRect.Max.Y, 1.0f);
++
++				FGraphicsPipelineStateInitializer GraphicsPSOInit;
++				RHICmdList.ApplyCachedRenderTargets(GraphicsPSOInit);
++				GraphicsPSOInit.BlendState = TStaticBlendState<CW_RED, BO_Add, BF_DestColor, BF_Zero>::GetRHI();
++				GraphicsPSOInit.RasterizerState = RasterizerState;
++				GraphicsPSOInit.DepthStencilState = TStaticDepthStencilState<false, CF_Always>::GetRHI();
++				GraphicsPSOInit.BoundShaderState.VertexDeclarationRHI = GMobilePrimitiveAOVertexDeclaration.VertexDeclarationRHI;
++				GraphicsPSOInit.BoundShaderState.VertexShaderRHI = VertexShader.GetVertexShader();
++				GraphicsPSOInit.BoundShaderState.PixelShaderRHI = PixelShader.GetPixelShader();
++				GraphicsPSOInit.PrimitiveType = PT_TriangleList;
++				SetGraphicsPipelineState(RHICmdList, GraphicsPSOInit, 0);
++
++				SetShaderParameters(RHICmdList, VertexShader, VertexShader.GetVertexShader(), PassParameters->VS);
++				SetShaderParameters(RHICmdList, PixelShader, PixelShader.GetPixelShader(), PassParameters->PS);
++
++				RHICmdList.SetStreamSource(0, PassParameters->Vertices->GetRHI(), 0);
++				RHICmdList.DrawPrimitive(0, NumTriangles, 1);
++			});
++	}
++}
+diff --git a/Engine/Source/Runtime/Renderer/Private/MobilePrimitiveAORendering.h b/Engine/Source/Runtime/Renderer/Private/MobilePrimitiveAORendering.h
+new file mode 100644
+index 000000000000..0768ead97670
+--- /dev/null
++++ b/Engine/Source/Runtime/Renderer/Private/MobilePrimitiveAORendering.h
+@@ -0,0 +1,16 @@
++// Copyright (c) 2026 Jared Taylor.
++
++#pragma once
++
++#include "CoreMinimal.h"
++
++class FRDGBuilder;
++class FRDGTexture;
++class FScene;
++class FViewInfo;
++
++/** Whether any movable primitive will occlude this frame, so mobile ambient occlusion is worth producing for it. */
++bool ShouldRenderMobilePrimitiveAO(const FScene* Scene);
++
++/** Multiplies analytic occlusion from movable primitives' capsules and bounding ellipsoids into the mobile ambient occlusion texture. */
++void RenderMobilePrimitiveAO(FRDGBuilder& GraphBuilder, const FScene* Scene, TArrayView<const FViewInfo> Views, FRDGTexture* SceneDepth, FRDGTexture* AmbientOcclusion);
+diff --git a/Engine/Source/Runtime/Renderer/Private/MobileShadingRenderer.cpp b/Engine/Source/Runtime/Renderer/Private/MobileShadingRenderer.cpp
+index adcb6bd8091b..cf60ac4be875 100644
+--- a/Engine/Source/Runtime/Renderer/Private/MobileShadingRenderer.cpp
++++ b/Engine/Source/Runtime/Renderer/Private/MobileShadingRenderer.cpp
+@@ -100,6 +100,7 @@
+ #include "SceneCulling/SceneCullingRenderer.h"
+ #include "SceneExtensions.h"
+ #include "MobileHeightFieldAORendering.h"
++#include "MobilePrimitiveAORendering.h"
+ #include "SceneInterface.h"
+ #include "SceneManagement.h"
+ #include "SceneOcclusion.h"
+@@ -1771,6 +1772,7 @@ void FMobileSceneRenderer::Render(FRDGBuilder& GraphBuilder, const FSceneRenderU
+ 		if (HasBeenProduced(BasePassTextures.AmbientOcclusionTexture))
+ 		{
+ 			RenderMobileHeightFieldAO(GraphBuilder, Scene, Views, SceneTextures.Depth.Resolve, BasePassTextures.AmbientOcclusionTexture);
++			RenderMobilePrimitiveAO(GraphBuilder, Scene, Views, SceneTextures.Depth.Resolve, BasePassTextures.AmbientOcclusionTexture);
+ 		}
+ 
+ 		// When renderer is in ERendererOutput::DepthPrepassOnly mode, bRequiresShadowProjections is set to false in InitViews()
+@@ -3008,6 +3010,7 @@ void FMobileSceneRenderer::RenderDeferredMultiPass(FRDGBuilder& GraphBuilder, FS
+ 	if (HasBeenProduced(BasePassTextures.AmbientOcclusionTexture))
+ 	{
+ 		RenderMobileHeightFieldAO(GraphBuilder, Scene, Views, SceneTextures.Depth.Resolve, BasePassTextures.AmbientOcclusionTexture);
++		RenderMobilePrimitiveAO(GraphBuilder, Scene, Views, SceneTextures.Depth.Resolve, BasePassTextures.AmbientOcclusionTexture);
+ 	}
+ 
+ 	if (bRequiresShadowProjections)
