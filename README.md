@@ -2,6 +2,9 @@
 
 Clean MSAA and proper ambient occlusion for Unreal Engine 5.8's mobile forward renderer, on PC and mobile hardware. Engine patches for a source build; everything is off until you turn it on.
 
+> [!IMPORTANT]
+> Level up to a modern forward rendering solution with clean MSAA, ambient occlusion, bounce lighting and deferred-style decals.
+
 ## Comparisons & Gameplay Videos
 
 [Click Me - The site is better than this readme](https://vaei.github.io/ForwardLevelUp/)
