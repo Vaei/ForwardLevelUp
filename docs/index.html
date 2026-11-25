@@ -79,6 +79,9 @@ footer { color: var(--muted); font-size: 14px; }
       <div class="card"><h3>Bounce light</h3><p>Coloured light bounced off the buildings and street around you, from the same height capture as the occlusion.</p></div>
       <div class="card"><h3>Contact shadows for anything</h3><p>Vehicles and props darken the ground under them too, without distance fields.</p></div>
       <div class="card"><h3>Clean soft particles</h3><p>Depth-faded particles stop leaving a halo around foreground edges.</p></div>
+      <div class="card"><h3>Reflections that keep up</h3><p>A moving object's reflection stays under it, with MSAA on and no TAA.</p></div>
+      <div class="card"><h3>Virtual shadow maps</h3><p>Sharp sun, spot, point and rect light shadows at every distance, without Nanite or TAA. Optionally hard at contact and softer with distance.</p></div>
+      <div class="card"><h3>Probe GI</h3><p>Interiors and covered streets stop glowing with sky light. Sun, sky, neon and local lights bounce, in the colour of the surface they hit.</p></div>
     </div>
   </section>
 
@@ -110,11 +113,24 @@ footer { color: var(--muted); font-size: 14px; }
     <figure><img src="img/extra_normal.jpg" alt="A scene and its world normals read by a post-process material" width="1940" height="543" loading="lazy"><figcaption>World normals in forward · left the scene, right a post-process material reading WorldNormal</figcaption></figure>
   </section>
 
+  <section>
+    <h2>Shadows, GI and reflections</h2>
+    <p>Test level, 1280x720.</p>
+    <figure><img src="img/extra_vsm.jpg" alt="The same street with cascaded shadow maps and with virtual shadow maps" width="1930" height="540" loading="lazy"><figcaption>Virtual shadow maps · left cascaded shadow maps, right virtual shadow maps, sharp at every distance</figcaption></figure>
+    <figure><img src="img/extra_pcss_base.jpg" alt="A building's shadow with the fixed filter and with contact-hardening soft shadows" width="1930" height="540" loading="lazy"><figcaption>Soft shadows at the base of a tall building · left fixed filter, right contact-hardening, hard where the building meets the ground. Sun source angle 3°</figcaption></figure>
+    <figure><img src="img/extra_pcss_tip.jpg" alt="The far end of the same shadow with the fixed filter and with contact-hardening soft shadows" width="1930" height="540" loading="lazy"><figcaption>Soft shadows at the far end of the same shadow · the penumbra widens with distance from the building</figcaption></figure>
+    <figure><img src="img/extra_rect.jpg" alt="A cube lit by a rect light: no shadow with stock mobile, shadowed with virtual shadow maps" width="1940" height="360" loading="lazy"><figcaption>Rect light · left stock mobile, which never shadows rect lights; middle virtual shadow maps; right with soft shadows</figcaption></figure>
+    <figure><img src="img/extra_probegi_top.jpg" alt="The street lit by the sky light and by probe GI" width="1930" height="540" loading="lazy"><figcaption>Probe GI · left the sky light, right probe GI, with light bounced off the sunlit street and walls</figcaption></figure>
+    <figure><img src="img/extra_probegi_under.jpg" alt="Under an overpass, sky light against probe GI" width="1930" height="540" loading="lazy"><figcaption>Probe GI under an overpass · left sky light, right probe GI</figcaption></figure>
+    <figure><img src="img/extra_probegi_colors.jpg" alt="A closed room lit through its door, with an assumed grey albedo and with each surface's own colour" width="1930" height="540" loading="lazy"><figcaption>Surface colours in a closed room · left every off-screen hit assumed grey, right each hit in its mesh's base colour, so the red wall tints the ceiling and floor. Brightened 4x</figcaption></figure>
+    <figure><img src="img/extra_ssrvelocity.jpg" alt="Three frames of a moving block on a glossy floor, without and with reflection velocity" width="1320" height="580" loading="lazy"><figcaption>Reflections of moving objects · top without velocity, where the reflection trails the block; bottom with it</figcaption></figure>
+  </section>
+
   <section id="start">
     <h2>Set it up</h2>
     <p>You need a UE 5.8 source build, and a project on the mobile renderer: <code>bPreferFeatureLevelES31</code> on PC, or a mobile platform.</p>
     <ol>
-      <li>Download the repository and apply the fourteen patches in <code>Patches/</code> to the engine, in order, with <code>git apply</code>.</li>
+      <li>Download the repository and apply the twenty patches in <code>Patches/</code> to the engine, in order, with <code>git apply</code>.</li>
       <li>Build the editor. The first launch recompiles every material.</li>
       <li>Add the settings below to <code>Config/DefaultEngine.ini</code> under <code>[/Script/Engine.RendererSettings]</code>, then restart the editor.</li>
     </ol>
@@ -126,7 +142,7 @@ r.Mobile.MSAA.EdgeAwareFetch=1
 r.Mobile.MSAA.SkipRedundantResolve=1
 r.Mobile.AmbientOcclusion=1
 r.DefaultFeature.AmbientOcclusion=True</code></pre>
-    <p>The <a href="https://github.com/Vaei/ForwardLevelUp#readme">README</a> covers the optional extras (distance-field AO, contact shadows, reflections, occlusion and bounce light from buildings, decals, soft particles, world normals), what to check when something doesn't show up, and every setting.</p>
+    <p>The <a href="https://github.com/Vaei/ForwardLevelUp#readme">README</a> covers the optional extras (distance-field AO, contact shadows, reflections, occlusion and bounce light from buildings, decals, soft particles, world normals, virtual shadow maps, probe GI), what to check when something doesn't show up, and every setting.</p>
   </section>
 
   <section>
@@ -145,8 +161,12 @@ r.DefaultFeature.AmbientOcclusion=True</code></pre>
         <tr><td>World normals</td><td class="num">~0.07 ms</td></tr>
         <tr><td>Bounce light from buildings</td><td class="num">0.02 ms</td></tr>
         <tr><td>Contact shadows for movables (12 casters)</td><td class="num">0.045 ms</td></tr>
+        <tr><td>Reflection velocity *</td><td class="num">0.02 ms</td></tr>
+        <tr><td>Virtual shadow maps, page marking and shadow depths *</td><td class="num">~0.28 ms</td></tr>
+        <tr><td>Probe GI *</td><td class="num">~0.24 ms</td></tr>
       </tbody>
     </table></div>
+    <p class="fine">* At 1280x720 in a test level.</p>
   </section>
 
   <section>
@@ -170,6 +190,12 @@ r.DefaultFeature.AmbientOcclusion=True</code></pre>
           <tr><td>12 Height-field clipmap</td><td>One capture of the whole level.</td><td>A toroidal window that follows the camera, captured a few tiles per frame.</td></tr>
           <tr><td>13 Height-field GI</td><td>No bounce light without baked lighting.</td><td>One bounce off the height field (<code>r.Mobile.HeightFieldGI</code>).</td></tr>
           <tr><td>14 Clustered decals</td><td>Forward decals draw over scene colour with their own lighting, no normals or roughness, no local lights.</td><td>Baked into an atlas and applied in the base pass from screen tile lists (<code>r.Mobile.ClusteredDecals</code>).</td></tr>
+          <tr><td>15 SSR velocity</td><td>Mobile renders no velocities without TAA, so reflections of moving objects lag behind them.</td><td>Velocities rendered and resolved under MSAA (<code>r.Mobile.ScreenSpaceReflections.Velocity</code>).</td></tr>
+          <tr><td>16 Virtual shadow maps</td><td>Virtual shadow maps need the deferred renderer.</td><td>Page marking from the depth prepass and lookups in the forward base pass, without Nanite (<code>r.Mobile.VirtualShadowMaps</code>). DirectX 12 on Windows; not on OpenGL or Vulkan.</td></tr>
+          <tr><td>17 Probe GI</td><td>Diffuse indirect light is the sky light everywhere, indoors included.</td><td>A probe grid around the camera traced through the global distance field (<code>r.Mobile.ProbeGI</code>).</td></tr>
+          <tr><td>18 Probe relocation</td><td>Probes on the grid sit inside walls and floors, which shows as blotches.</td><td>Each probe moves out of nearby geometry, and bright ray hits are clamped (<code>r.Mobile.ProbeGI.Relocation</code>, <code>r.Mobile.ProbeGI.MaxRayLuminance</code>).</td></tr>
+          <tr><td>19 Probe surface colours</td><td>Off-screen ray hits use one assumed albedo.</td><td>Each hit takes its mesh's base colour, found through the global distance field object grid (<code>r.Mobile.ProbeGI.SurfaceColors</code>).</td></tr>
+          <tr><td>20 Soft virtual shadows</td><td>A fixed-width filter; mobile never shadows rect lights.</td><td>Optional contact-hardening filter (<code>r.Mobile.VirtualShadowMaps.Filter</code>), and rect light shadows.</td></tr>
         </tbody>
       </table></div>
     </details>
