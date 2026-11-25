@@ -1,0 +1,416 @@
+diff --git a/Engine/Shaders/Private/MobileProbeGI.usf b/Engine/Shaders/Private/MobileProbeGI.usf
+index 6b755e2fab29..22c6989d7c06 100644
+--- a/Engine/Shaders/Private/MobileProbeGI.usf
++++ b/Engine/Shaders/Private/MobileProbeGI.usf
+@@ -67,10 +67,23 @@ float3 GetRayDirection(uint RayIndex)
+ 	return normalize(float3(dot(RayRotation0.xyz, Local), dot(RayRotation1.xyz, Local), dot(RayRotation2.xyz, Local)));
+ }
+ 
+-#if SHADER_TRACE
+-
++#if SHADER_TRACE || SHADER_FINALIZE
+ #include "DistanceField/GlobalDistanceFieldShared.ush"
+ #include "DistanceField/GlobalDistanceFieldUtils.ush"
++#endif
++
++// Backface ray distances are stored shortened by this, so the distance moments do not see far through walls
++#define PROBE_GI_BACKFACE_DISTANCE_SCALE 0.2f
++
++Buffer<float4> PrevProbeOffsets;
++
++/** The offset the probe traced from this frame. Probes without history start on the grid. */
++float3 GetPrevProbeOffset(uint StorageIndex, uint EffectiveState)
++{
++	return EffectiveState == PROBE_GI_STATE_RESET ? 0.0f : PrevProbeOffsets[StorageIndex].xyz;
++}
++
++#if SHADER_TRACE
+ 
+ RWBuffer<float4> RWRayData;
+ float MaxTraceDistance;
+@@ -91,6 +104,14 @@ SamplerState PrevSceneColorSampler;
+ float4 PrevScreenPositionScaleBias;
+ float PrevPreExposureInv;
+ uint bScreenRadiance;
++float MaxRayLuminance;
++
++/** Caps a hit's radiance at a multiple of white on screen, so the odd ray landing beside a bright light does not leave a spot in the probe history. */
++float3 ClampRayRadiance(float3 Radiance)
++{
++	const float ExposedLuminance = Luminance(Radiance) * View.PreExposure;
++	return ExposedLuminance > MaxRayLuminance ? Radiance * (MaxRayLuminance / ExposedLuminance) : Radiance;
++}
+ 
+ bool TraceGlobalSDF(float3 Origin, float3 Direction, float MaxDistance, out float HitTime, out uint HitClipmapIndex)
+ {
+@@ -196,12 +217,17 @@ void TraceCS(uint3 GroupId : SV_GroupID, uint GroupIndex : SV_GroupIndex)
+ 	const uint DispatchThreadId = GetLinearGroupIndex(GroupId) * THREADGROUP_SIZE + GroupIndex;
+ 	const uint ProbeIndex = DispatchThreadId / NumRays;
+ 	const uint RayIndex = DispatchThreadId % NumRays;
+-	if (ProbeIndex >= GetNumProbes() || !IsProbeScheduled(ProbeIndex, GetEffectiveProbeState(ProbeIndex)))
++	if (ProbeIndex >= GetNumProbes())
++	{
++		return;
++	}
++	const uint EffectiveState = GetEffectiveProbeState(ProbeIndex);
++	if (!IsProbeScheduled(ProbeIndex, EffectiveState))
+ 	{
+ 		return;
+ 	}
+ 
+-	const float3 ProbePosition = ProbeGITranslatedPosition(ProbeGILocalCoord(ProbeIndex));
++	const float3 ProbePosition = ProbeGITranslatedPosition(ProbeGILocalCoord(ProbeIndex)) + GetPrevProbeOffset(ProbeIndex, EffectiveState);
+ 	const float3 Direction = GetRayDirection(RayIndex);
+ 
+ 	float HitTime;
+@@ -216,7 +242,7 @@ void TraceCS(uint3 GroupId : SV_GroupID, uint GroupIndex : SV_GroupIndex)
+ 		if (dot(HitNormal, Direction) > 0.0f || HitTime < ProbeGI.Spacing * 0.05f)
+ 		{
+ 			// The probe sees the inside of a surface. Negative distance counts it for the inside-geometry test.
+-			Result = float4(0, 0, 0, -HitTime * 0.2f);
++			Result = float4(0, 0, 0, -HitTime * PROBE_GI_BACKFACE_DISTANCE_SCALE);
+ 		}
+ 		else
+ 		{
+@@ -235,7 +261,7 @@ void TraceCS(uint3 GroupId : SV_GroupID, uint GroupIndex : SV_GroupIndex)
+ 				const float3 Bounce = SampleMobileProbeGI(HitPosition, HitNormal, -Direction).rgb;
+ 				Radiance = DefaultAlbedo * (Direct / PI + Bounce);
+ 			}
+-			Result = float4(Radiance, HitTime);
++			Result = float4(ClampRayRadiance(Radiance), HitTime);
+ 		}
+ 	}
+ 	else
+@@ -335,6 +361,85 @@ void UpdateCS(uint3 GroupId : SV_GroupID, uint3 GroupThreadId : SV_GroupThreadID
+ 
+ Buffer<float4> RayData;
+ RWBuffer<uint> RWProbeState;
++RWBuffer<float4> RWProbeOffsets;
++uint bRelocate;
++float MinSurfaceDistance;
++float MaxOffset;
++
++/**
++ * Direction out of a surface the probe sits on, where the gradient is unreliable and a thin two-sided surface has none: the axis
++ * with the most free space, favouring the camera's side, which is the side that is seen.
++ */
++float3 GetEscapeDirection(float3 Position)
++{
++	const float3 ToCamera = normalize(View.TranslatedWorldCameraOrigin - Position);
++	float BestScore = -1e10f;
++	float3 Best = float3(0, 0, 1);
++	UNROLL
++	for (uint Axis = 0; Axis < 6; ++Axis)
++	{
++		float3 Direction = 0;
++		Direction[Axis >> 1] = (Axis & 1) ? -1.0f : 1.0f;
++		const float Score = GetDistanceToNearestSurfaceGlobal(Position + Direction * MinSurfaceDistance) + MinSurfaceDistance * dot(Direction, ToCamera);
++		if (Score > BestScore)
++		{
++			BestScore = Score;
++			Best = Direction;
++		}
++	}
++	return Best;
++}
++
++/**
++ * Moves a probe out of the geometry around it. Near a surface, the signed global distance field pushes it out along its gradient.
++ * Deeper inside than the distance field's narrow band, a probe that sees mostly backfaces steps through the nearest one.
++ * Otherwise it backs away from its closest ray hit.
++ */
++float3 RelocateProbe(uint ProbeIndex, float3 Offset, uint Backfaces)
++{
++	const float3 Position = ProbeGITranslatedPosition(ProbeGILocalCoord(ProbeIndex)) + Offset;
++
++	float ClosestBackface = 1e10f;
++	float3 ClosestBackfaceDirection = 0;
++	float ClosestFrontface = 1e10f;
++	float3 ClosestFrontfaceDirection = 0;
++	for (uint Ray = 0; Ray < NumRays; ++Ray)
++	{
++		const float W = RayData[ProbeIndex * NumRays + Ray].w;
++		const float Distance = W < 0.0f ? -W / PROBE_GI_BACKFACE_DISTANCE_SCALE : W;
++		if (W < 0.0f && Distance < ClosestBackface)
++		{
++			ClosestBackface = Distance;
++			ClosestBackfaceDirection = GetRayDirection(Ray);
++		}
++		else if (W >= 0.0f && Distance < ClosestFrontface)
++		{
++			ClosestFrontface = Distance;
++			ClosestFrontfaceDirection = GetRayDirection(Ray);
++		}
++	}
++
++	const float SurfaceDistance = GetDistanceToNearestSurfaceGlobal(Position);
++	const float3 Gradient = GetDistanceFieldGradientGlobal(Position);
++	const float GradientLength = length(Gradient);
++	if (abs(SurfaceDistance) < 0.25f * MinSurfaceDistance)
++	{
++		Offset += GetEscapeDirection(Position) * (MinSurfaceDistance - SurfaceDistance);
++	}
++	else if (SurfaceDistance < MinSurfaceDistance && GradientLength > 0.001f)
++	{
++		Offset += Gradient / GradientLength * (MinSurfaceDistance - SurfaceDistance);
++	}
++	else if (Backfaces * 4 > NumRays)
++	{
++		Offset += ClosestBackfaceDirection * (ClosestBackface + MinSurfaceDistance);
++	}
++	else if (ClosestFrontface < MinSurfaceDistance)
++	{
++		Offset -= ClosestFrontfaceDirection * (MinSurfaceDistance - ClosestFrontface);
++	}
++	return clamp(Offset, -MaxOffset, MaxOffset);
++}
+ 
+ [numthreads(THREADGROUP_SIZE, 1, 1)]
+ void FinalizeCS(uint3 GroupId : SV_GroupID, uint GroupIndex : SV_GroupIndex)
+@@ -346,9 +451,11 @@ void FinalizeCS(uint3 GroupId : SV_GroupID, uint GroupIndex : SV_GroupIndex)
+ 	}
+ 
+ 	const uint EffectiveState = GetEffectiveProbeState(ProbeIndex);
++	const float3 Offset = GetPrevProbeOffset(ProbeIndex, EffectiveState);
+ 	if (!IsProbeScheduled(ProbeIndex, EffectiveState))
+ 	{
+ 		RWProbeState[ProbeIndex] = EffectiveState;
++		RWProbeOffsets[ProbeIndex] = float4(Offset, 0);
+ 		return;
+ 	}
+ 
+@@ -359,6 +466,7 @@ void FinalizeCS(uint3 GroupId : SV_GroupID, uint GroupIndex : SV_GroupIndex)
+ 	}
+ 	// A probe that sees the inside of surfaces in more than a few directions sits in or against geometry, where it leaks
+ 	RWProbeState[ProbeIndex] = Backfaces * 10 > NumRays ? PROBE_GI_STATE_INSIDE : PROBE_GI_STATE_VALID;
++	RWProbeOffsets[ProbeIndex] = float4(bRelocate != 0 ? RelocateProbe(ProbeIndex, Offset, Backfaces) : 0.0f, 0);
+ }
+ 
+ #endif // SHADER_FINALIZE
+diff --git a/Engine/Shaders/Private/MobileProbeGICommon.ush b/Engine/Shaders/Private/MobileProbeGICommon.ush
+index 2ab904e552d7..46760d695ad6 100644
+--- a/Engine/Shaders/Private/MobileProbeGICommon.ush
++++ b/Engine/Shaders/Private/MobileProbeGICommon.ush
+@@ -38,11 +38,18 @@ int3 ProbeGILocalCoord(uint StorageIndex)
+ 	return ProbeGIPositiveMod(Storage - ProbeGI.GridMin, Size);
+ }
+ 
++/** Where the probe sits on the grid, before relocation. */
+ float3 ProbeGITranslatedPosition(int3 LocalCoord)
+ {
+ 	return ProbeGI.GridMinTranslated + float3(LocalCoord) * ProbeGI.Spacing;
+ }
+ 
++/** Where the probe traces from and is seen from: its grid position moved out of nearby geometry. */
++float3 ProbeGIRelocatedPosition(int3 LocalCoord, uint StorageIndex)
++{
++	return ProbeGITranslatedPosition(LocalCoord) + ProbeGI.ProbeOffsets[StorageIndex].xyz;
++}
++
+ uint2 ProbeGITileOrigin(uint StorageIndex, uint TileSize)
+ {
+ 	return uint2(StorageIndex % ProbeGI.TilesPerRow, StorageIndex / ProbeGI.TilesPerRow) * TileSize;
+@@ -106,7 +113,7 @@ float4 SampleMobileProbeGI(float3 TranslatedWorldPosition, float3 WorldNormal, f
+ 			continue;
+ 		}
+ 
+-		const float3 ProbePosition = ProbeGITranslatedPosition(LocalCoord);
++		const float3 ProbePosition = ProbeGIRelocatedPosition(LocalCoord, StorageIndex);
+ 		const float3 Trilinear = lerp(1.0f - Alpha, Alpha, float3(Offset));
+ 
+ 		// Smooth backface test: probes behind the surface contribute little, without a hard cut
+diff --git a/Engine/Source/Runtime/Renderer/Private/MobileProbeGI.cpp b/Engine/Source/Runtime/Renderer/Private/MobileProbeGI.cpp
+index 5b4d74058399..77ca7ca2d5ad 100644
+--- a/Engine/Source/Runtime/Renderer/Private/MobileProbeGI.cpp
++++ b/Engine/Source/Runtime/Renderer/Private/MobileProbeGI.cpp
+@@ -98,6 +98,36 @@ static TAutoConsoleVariable<int32> CVarMobileProbeGILocalLightShadows(
+ 	TEXT("Whether those lights are shadowed at the hit, by a ray through the global distance field. Off is cheaper and leaks light through walls."),
+ 	ECVF_Scalability | ECVF_RenderThreadSafe);
+ 
++static TAutoConsoleVariable<int32> CVarMobileProbeGIRelocation(
++	TEXT("r.Mobile.ProbeGI.Relocation"),
++	1,
++	TEXT("Moves each probe out of nearby geometry, up to under half the spacing, so probes buried in or pressed against walls still light them."),
++	ECVF_Scalability | ECVF_RenderThreadSafe);
++
++static TAutoConsoleVariable<float> CVarMobileProbeGIRelocationDistance(
++	TEXT("r.Mobile.ProbeGI.RelocationDistance"),
++	0.3f,
++	TEXT("Distance relocation keeps between a probe and the nearest surface, as a fraction of the spacing."),
++	ECVF_Scalability | ECVF_RenderThreadSafe);
++
++static TAutoConsoleVariable<float> CVarMobileProbeGINormalBias(
++	TEXT("r.Mobile.ProbeGI.NormalBias"),
++	0.2f,
++	TEXT("How far along its normal a surface looks up the probes, as a fraction of the spacing. Higher hides more leaks and blotches and softens contact."),
++	ECVF_Scalability | ECVF_RenderThreadSafe);
++
++static TAutoConsoleVariable<float> CVarMobileProbeGIViewBias(
++	TEXT("r.Mobile.ProbeGI.ViewBias"),
++	0.1f,
++	TEXT("How far towards the camera a surface looks up the probes, as a fraction of the spacing."),
++	ECVF_Scalability | ECVF_RenderThreadSafe);
++
++static TAutoConsoleVariable<float> CVarMobileProbeGIMaxRayLuminance(
++	TEXT("r.Mobile.ProbeGI.MaxRayLuminance"),
++	8.0f,
++	TEXT("Brightest a probe ray hit may be, in multiples of white on screen. Lower removes spots of light near bright lamps; higher keeps more of their bounce."),
++	ECVF_Scalability | ECVF_RenderThreadSafe);
++
+ IMPLEMENT_GLOBAL_SHADER_PARAMETER_STRUCT(FMobileProbeGIUniformParameters, "MobileProbeGI");
+ 
+ namespace MobileProbeGI
+@@ -124,6 +154,7 @@ public:
+ 		TRefCountPtr<IPooledRenderTarget> Irradiance;
+ 		TRefCountPtr<IPooledRenderTarget> Distance;
+ 		TRefCountPtr<FRDGPooledBuffer> State;
++		TRefCountPtr<FRDGPooledBuffer> Offsets;
+ 		FIntVector GridMin = FIntVector::ZeroValue;
+ 		FIntVector GridSize = FIntVector::ZeroValue;
+ 		float Spacing = 0.0f;
+@@ -158,6 +189,7 @@ public:
+ BEGIN_SHADER_PARAMETER_STRUCT(FMobileProbeGICommonParameters, )
+ 	SHADER_PARAMETER_RDG_UNIFORM_BUFFER(FMobileProbeGIUniformParameters, MobileProbeGI)
+ 	SHADER_PARAMETER_RDG_BUFFER_SRV(Buffer<uint>, PrevProbeState)
++	SHADER_PARAMETER_RDG_BUFFER_SRV(Buffer<float4>, PrevProbeOffsets)
+ 	SHADER_PARAMETER(FIntVector, PrevGridMin)
+ 	SHADER_PARAMETER(uint32, bResetAll)
+ 	SHADER_PARAMETER(uint32, NumRays)
+@@ -193,6 +225,7 @@ class FMobileProbeGITraceCS : public FMobileProbeGIShader
+ 		SHADER_PARAMETER(FVector4f, PrevScreenPositionScaleBias)
+ 		SHADER_PARAMETER(float, PrevPreExposureInv)
+ 		SHADER_PARAMETER(uint32, bScreenRadiance)
++		SHADER_PARAMETER(float, MaxRayLuminance)
+ 	END_SHADER_PARAMETER_STRUCT()
+ 
+ 	static void ModifyCompilationEnvironment(const FGlobalShaderPermutationParameters& Parameters, FShaderCompilerEnvironment& OutEnvironment)
+@@ -235,9 +268,15 @@ class FMobileProbeGIFinalizeCS : public FMobileProbeGIShader
+ 	SHADER_USE_PARAMETER_STRUCT(FMobileProbeGIFinalizeCS, FMobileProbeGIShader);
+ 
+ 	BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
++		SHADER_PARAMETER_STRUCT_REF(FViewUniformShaderParameters, View)
+ 		SHADER_PARAMETER_STRUCT_INCLUDE(FMobileProbeGICommonParameters, Common)
++		SHADER_PARAMETER_STRUCT_INCLUDE(FGlobalDistanceFieldParameters2, GlobalDistanceFieldParameters)
+ 		SHADER_PARAMETER_RDG_BUFFER_SRV(Buffer<float4>, RayData)
+ 		SHADER_PARAMETER_RDG_BUFFER_UAV(RWBuffer<uint>, RWProbeState)
++		SHADER_PARAMETER_RDG_BUFFER_UAV(RWBuffer<float4>, RWProbeOffsets)
++		SHADER_PARAMETER(uint32, bRelocate)
++		SHADER_PARAMETER(float, MinSurfaceDistance)
++		SHADER_PARAMETER(float, MaxOffset)
+ 	END_SHADER_PARAMETER_STRUCT()
+ 
+ 	static void ModifyCompilationEnvironment(const FGlobalShaderPermutationParameters& Parameters, FShaderCompilerEnvironment& OutEnvironment)
+@@ -271,6 +310,7 @@ void SetupMobileProbeGIDummyParameters(FRDGBuilder& GraphBuilder, FMobileProbeGI
+ 	OutParameters.DistanceAtlas = SystemTextures.Black;
+ 	OutParameters.AtlasSampler = TStaticSamplerState<SF_Bilinear, AM_Clamp, AM_Clamp, AM_Clamp>::GetRHI();
+ 	OutParameters.ProbeState = GraphBuilder.CreateSRV(GSystemTextures.GetDefaultBuffer(GraphBuilder, sizeof(uint32), 0u), PF_R32_UINT);
++	OutParameters.ProbeOffsets = GraphBuilder.CreateSRV(GSystemTextures.GetDefaultBuffer(GraphBuilder, sizeof(FFloat16Color)), PF_FloatRGBA);
+ 	OutParameters.GridMinTranslated = FVector3f::ZeroVector;
+ 	OutParameters.Spacing = 1.0f;
+ 	OutParameters.GridSize = FIntVector(2, 2, 2);
+@@ -411,7 +451,7 @@ void RenderMobileProbeGI(FRDGBuilder& GraphBuilder, const FSceneRenderer& SceneR
+ 	const FIntVector CameraCoord(FMath::FloorToInt32(CameraPosition.X / Spacing), FMath::FloorToInt32(CameraPosition.Y / Spacing), FMath::FloorToInt32(CameraPosition.Z / Spacing));
+ 	const FIntVector GridMin = CameraCoord - GridSize / 2;
+ 
+-	const bool bResetAll = !Volume.Irradiance || !Volume.Distance || !Volume.State || Volume.GridSize != GridSize || Volume.Spacing != Spacing;
++	const bool bResetAll = !Volume.Irradiance || !Volume.Distance || !Volume.State || !Volume.Offsets || Volume.GridSize != GridSize || Volume.Spacing != Spacing;
+ 	const FIntVector PrevGridMin = bResetAll ? GridMin : Volume.GridMin;
+ 
+ 	const int32 TileRows = FMath::DivideAndRoundUp(NumProbes, MobileProbeGI::TilesPerRow);
+@@ -424,12 +464,16 @@ void RenderMobileProbeGI(FRDGBuilder& GraphBuilder, const FSceneRenderer& SceneR
+ 	FRDGBufferRef PrevState = bResetAll
+ 		? GSystemTextures.GetDefaultBuffer(GraphBuilder, sizeof(uint32), 0u)
+ 		: GraphBuilder.RegisterExternalBuffer(Volume.State);
++	FRDGBufferRef PrevOffsets = bResetAll
++		? GSystemTextures.GetDefaultBuffer(GraphBuilder, sizeof(FFloat16Color))
++		: GraphBuilder.RegisterExternalBuffer(Volume.Offsets);
+ 
+ 	FRDGTextureRef Irradiance = GraphBuilder.CreateTexture(
+ 		FRDGTextureDesc::Create2D(IrradianceExtent, PF_FloatRGBA, FClearValueBinding::Black, TexCreate_ShaderResource | TexCreate_UAV), TEXT("MobileProbeGI.Irradiance"));
+ 	FRDGTextureRef Distance = GraphBuilder.CreateTexture(
+ 		FRDGTextureDesc::Create2D(DistanceExtent, PF_G16R16F, FClearValueBinding::Black, TexCreate_ShaderResource | TexCreate_UAV), TEXT("MobileProbeGI.Distance"));
+ 	FRDGBufferRef State = GraphBuilder.CreateBuffer(FRDGBufferDesc::CreateBufferDesc(sizeof(uint32), NumProbes), TEXT("MobileProbeGI.State"));
++	FRDGBufferRef Offsets = GraphBuilder.CreateBuffer(FRDGBufferDesc::CreateBufferDesc(sizeof(FFloat16Color), NumProbes), TEXT("MobileProbeGI.Offsets"));
+ 	FRDGBufferRef RayData = GraphBuilder.CreateBuffer(FRDGBufferDesc::CreateBufferDesc(sizeof(FFloat16Color), NumProbes * NumRays), TEXT("MobileProbeGI.RayData"));
+ 
+ 	FMobileProbeGIUniformParameters SamplingParameters;
+@@ -442,14 +486,15 @@ void RenderMobileProbeGI(FRDGBuilder& GraphBuilder, const FSceneRenderer& SceneR
+ 	SamplingParameters.Intensity = Intensity;
+ 	SamplingParameters.IrradianceAtlasInvSize = FVector2f(1.0f / IrradianceExtent.X, 1.0f / IrradianceExtent.Y);
+ 	SamplingParameters.DistanceAtlasInvSize = FVector2f(1.0f / DistanceExtent.X, 1.0f / DistanceExtent.Y);
+-	SamplingParameters.NormalBias = 0.2f;
+-	SamplingParameters.ViewBias = 0.1f;
++	SamplingParameters.NormalBias = FMath::Clamp(CVarMobileProbeGINormalBias.GetValueOnRenderThread(), 0.0f, 1.0f);
++	SamplingParameters.ViewBias = FMath::Clamp(CVarMobileProbeGIViewBias.GetValueOnRenderThread(), 0.0f, 1.0f);
+ 
+ 	// Rays sample last frame's probes for the bounce after the first; the updates must not read the atlases they write
+ 	FMobileProbeGIUniformParameters* TraceUniformParameters = GraphBuilder.AllocParameters<FMobileProbeGIUniformParameters>(&SamplingParameters);
+ 	TraceUniformParameters->IrradianceAtlas = HistoryIrradiance;
+ 	TraceUniformParameters->DistanceAtlas = HistoryDistance;
+ 	TraceUniformParameters->ProbeState = GraphBuilder.CreateSRV(PrevState, PF_R32_UINT);
++	TraceUniformParameters->ProbeOffsets = GraphBuilder.CreateSRV(PrevOffsets, PF_FloatRGBA);
+ 	if (bResetAll)
+ 	{
+ 		TraceUniformParameters->Intensity = 0.0f;
+@@ -460,11 +505,13 @@ void RenderMobileProbeGI(FRDGBuilder& GraphBuilder, const FSceneRenderer& SceneR
+ 	UpdateUniformParameters->IrradianceAtlas = SystemTextures.Black;
+ 	UpdateUniformParameters->DistanceAtlas = SystemTextures.Black;
+ 	UpdateUniformParameters->ProbeState = GraphBuilder.CreateSRV(GSystemTextures.GetDefaultBuffer(GraphBuilder, sizeof(uint32), 0u), PF_R32_UINT);
++	UpdateUniformParameters->ProbeOffsets = GraphBuilder.CreateSRV(GSystemTextures.GetDefaultBuffer(GraphBuilder, sizeof(FFloat16Color)), PF_FloatRGBA);
+ 	TRDGUniformBufferRef<FMobileProbeGIUniformParameters> UpdateUniformBuffer = GraphBuilder.CreateUniformBuffer(UpdateUniformParameters);
+ 
+ 	const FMatrix44f RayRotation = MakeRayRotation(Volume.FrameIndex);
+ 	FMobileProbeGICommonParameters Common;
+ 	Common.PrevProbeState = GraphBuilder.CreateSRV(PrevState, PF_R32_UINT);
++	Common.PrevProbeOffsets = GraphBuilder.CreateSRV(PrevOffsets, PF_FloatRGBA);
+ 	Common.PrevGridMin = PrevGridMin;
+ 	Common.bResetAll = bResetAll ? 1 : 0;
+ 	Common.NumRays = NumRays;
+@@ -487,6 +534,7 @@ void RenderMobileProbeGI(FRDGBuilder& GraphBuilder, const FSceneRenderer& SceneR
+ 		PassParameters->DefaultAlbedo = FMath::Clamp(CVarMobileProbeGIAlbedo.GetValueOnRenderThread(), 0.0f, 1.0f);
+ 		PassParameters->SunShadowDistance = PassParameters->MaxTraceDistance;
+ 		PassParameters->SceneDepthTexture = SceneDepth;
++		PassParameters->MaxRayLuminance = FMath::Max(CVarMobileProbeGIMaxRayLuminance.GetValueOnRenderThread(), 0.01f);
+ 
+ 		PassParameters->SunDirection = FVector3f::UpVector;
+ 		PassParameters->SunColor = FVector3f::ZeroVector;
+@@ -579,6 +627,13 @@ void RenderMobileProbeGI(FRDGBuilder& GraphBuilder, const FSceneRenderer& SceneR
+ 		PassParameters->Common.DispatchGroupsX = GroupCount.X;
+ 		PassParameters->RayData = GraphBuilder.CreateSRV(RayData, PF_FloatRGBA);
+ 		PassParameters->RWProbeState = GraphBuilder.CreateUAV(State, PF_R32_UINT);
++		PassParameters->View = View.ViewUniformBuffer;
++		PassParameters->GlobalDistanceFieldParameters = SetupGlobalDistanceFieldParameters(View.GlobalDistanceFieldInfo.ParameterData);
++		PassParameters->RWProbeOffsets = GraphBuilder.CreateUAV(Offsets, PF_FloatRGBA);
++		PassParameters->bRelocate = CVarMobileProbeGIRelocation.GetValueOnRenderThread() != 0 ? 1 : 0;
++		PassParameters->MinSurfaceDistance = FMath::Clamp(CVarMobileProbeGIRelocationDistance.GetValueOnRenderThread(), 0.0f, 0.45f) * Spacing;
++		// Under half the spacing, so a probe never crosses a neighbour and trilinear weights stay meaningful
++		PassParameters->MaxOffset = 0.45f * Spacing;
+ 
+ 		TShaderMapRef<FMobileProbeGIFinalizeCS> ComputeShader(View.ShaderMap);
+ 		FComputeShaderUtils::AddPass(
+@@ -592,6 +647,7 @@ void RenderMobileProbeGI(FRDGBuilder& GraphBuilder, const FSceneRenderer& SceneR
+ 	GraphBuilder.QueueTextureExtraction(Irradiance, &Volume.Irradiance);
+ 	GraphBuilder.QueueTextureExtraction(Distance, &Volume.Distance);
+ 	GraphBuilder.QueueBufferExtraction(State, &Volume.State);
++	GraphBuilder.QueueBufferExtraction(Offsets, &Volume.Offsets);
+ 	Volume.GridMin = GridMin;
+ 	Volume.GridSize = GridSize;
+ 	Volume.Spacing = Spacing;
+@@ -601,4 +657,5 @@ void RenderMobileProbeGI(FRDGBuilder& GraphBuilder, const FSceneRenderer& SceneR
+ 	OutParameters.IrradianceAtlas = Irradiance;
+ 	OutParameters.DistanceAtlas = Distance;
+ 	OutParameters.ProbeState = GraphBuilder.CreateSRV(State, PF_R32_UINT);
++	OutParameters.ProbeOffsets = GraphBuilder.CreateSRV(Offsets, PF_FloatRGBA);
+ }
+diff --git a/Engine/Source/Runtime/Renderer/Private/MobileProbeGI.h b/Engine/Source/Runtime/Renderer/Private/MobileProbeGI.h
+index 2b2427a7f0e6..be0f6e6a5f86 100644
+--- a/Engine/Source/Runtime/Renderer/Private/MobileProbeGI.h
++++ b/Engine/Source/Runtime/Renderer/Private/MobileProbeGI.h
+@@ -18,6 +18,7 @@ BEGIN_GLOBAL_SHADER_PARAMETER_STRUCT(FMobileProbeGIUniformParameters, )
+ 	SHADER_PARAMETER_RDG_TEXTURE(Texture2D, DistanceAtlas)
+ 	SHADER_PARAMETER_SAMPLER(SamplerState, AtlasSampler)
+ 	SHADER_PARAMETER_RDG_BUFFER_SRV(Buffer<uint>, ProbeState)
++	SHADER_PARAMETER_RDG_BUFFER_SRV(Buffer<float4>, ProbeOffsets)
+ 	SHADER_PARAMETER(FVector3f, GridMinTranslated)
+ 	SHADER_PARAMETER(float, Spacing)
+ 	SHADER_PARAMETER(FIntVector, GridSize)

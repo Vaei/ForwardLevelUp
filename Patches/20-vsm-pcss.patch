@@ -1,0 +1,306 @@
+diff --git a/Engine/Shaders/Private/MobileLightingCommon.ush b/Engine/Shaders/Private/MobileLightingCommon.ush
+index 7da4bdbc8e99..92d7ba43cb9d 100644
+--- a/Engine/Shaders/Private/MobileLightingCommon.ush
++++ b/Engine/Shaders/Private/MobileLightingCommon.ush
+@@ -355,7 +355,8 @@ void AccumulateDirectionalLighting(FGBufferData GBuffer, float3 TranslatedWorldP
+ 	BRANCH
+ 	if (ForwardLightStruct.DirectionalLightVSM != INDEX_NONE)
+ 	{
+-		DynamicShadowing *= MobileVirtualShadowMapFilter(true, ForwardLightStruct.DirectionalLightVSM, TranslatedWorldPosition, GBuffer.WorldNormal, LightData.Direction, ScreenPosition.w);
++		DynamicShadowing *= MobileVirtualShadowMapFilter(true, ForwardLightStruct.DirectionalLightVSM, TranslatedWorldPosition, GBuffer.WorldNormal, LightData.Direction, ScreenPosition.w,
++			ForwardLightStruct.DirectionalLightSourceRadius, 0.0f);
+ 	}
+ #endif
+ 
+@@ -710,8 +711,12 @@ void AccumulateLightGridLocalLighting(const FCulledLightsGridHeader InLightGridH
+ 		BRANCH
+ 		if (LocalLight.Internal.VirtualShadowMapId != INDEX_NONE)
+ 		{
+-			const float3 ToLight = normalize(LightData.TranslatedWorldPosition - TranslatedWorldPosition);
+-			DynamicShadowing = MobileVirtualShadowMapFilter(false, LocalLight.Internal.VirtualShadowMapId, TranslatedWorldPosition, GBuffer.WorldNormal, ToLight, GBuffer.Depth);
++			const float3 LightVector = LightData.TranslatedWorldPosition - TranslatedWorldPosition;
++			const float LightDistance = length(LightVector);
++			// Unpacked rather than from LightData, which mobile clears. A rect light packs its half width and half height here.
++			const float LightSourceRadius = max(UnpackLightSourceRadius(LocalLight), UnpackLightSourceLength(LocalLight));
++			DynamicShadowing = MobileVirtualShadowMapFilter(false, LocalLight.Internal.VirtualShadowMapId, TranslatedWorldPosition, GBuffer.WorldNormal, LightVector / LightDistance, GBuffer.Depth,
++				LightSourceRadius, LightDistance);
+ 		}
+ #endif
+ 
+diff --git a/Engine/Shaders/Private/MobileVirtualShadowMaps.ush b/Engine/Shaders/Private/MobileVirtualShadowMaps.ush
+index c0c8692e73db..2fa0c7689a16 100644
+--- a/Engine/Shaders/Private/MobileVirtualShadowMaps.ush
++++ b/Engine/Shaders/Private/MobileVirtualShadowMaps.ush
+@@ -3,16 +3,92 @@
+ #pragma once
+ 
+ #include "VirtualShadowMaps/VirtualShadowMapProjectionCommon.ush"
++#include "Random.ush"
+ 
+ #ifndef MOBILE_VSM_FILTER_TAPS
+ #define MOBILE_VSM_FILTER_TAPS 5
+ #endif
+ 
++#define MOBILE_VSM_PCSS_BLOCKER_TAPS 8
++#define MOBILE_VSM_PCSS_FILTER_TAPS 16
++
++FVirtualShadowMapSampleResult SampleMobileVirtualShadowMap(bool bDirectional, int VirtualShadowMapId, float3 TranslatedWorldPosition, float RayStartDistance, float3 WorldNormal, float SceneDepth)
++{
++	if (bDirectional)
++	{
++		return SampleVirtualShadowMapDirectional(VirtualShadowMapId, TranslatedWorldPosition, RayStartDistance, WorldNormal, true, SceneDepth);
++	}
++	return SampleVirtualShadowMapLocal(VirtualShadowMapId, TranslatedWorldPosition, RayStartDistance, WorldNormal, true, SceneDepth);
++}
++
++/** Point on a unit disk, spread evenly over Count points and rotated. */
++float2 MobileVogelDisk(uint Index, uint Count, float Rotation)
++{
++	const float Radius = sqrt((Index + 0.5f) / Count);
++	const float Angle = Index * 2.39996323f + Rotation;
++	return Radius * float2(cos(Angle), sin(Angle));
++}
++
++/** A rotation fixed to the screen pixel, so the PCSS taps dither between pixels without changing between frames. */
++float GetMobileVirtualShadowMapRotation(float3 TranslatedWorldPosition)
++{
++	const float4 Clip = mul(float4(TranslatedWorldPosition, 1.0f), View.TranslatedWorldToClip);
++	const float2 Pixel = (Clip.xy / Clip.w * float2(0.5f, -0.5f) + 0.5f) * View.ViewSizeAndInvSize.xy;
++	return 2.0f * PI * InterleavedGradientNoise(Pixel, 0);
++}
++
++/**
++ * Percentage-closer soft shadows: a blocker search around the receiver finds the mean occluder distance, which sets the penumbra
++ * width from the light's size, then the PCF taps spread over it. Contact stays hard and the penumbra widens with distance.
++ * LightSourceRadius is the sine of the half angle for a directional light, otherwise a world radius at LightDistance.
++ */
++half MobileVirtualShadowMapPCSS(bool bDirectional, int VirtualShadowMapId, float3 BiasedPosition, float RayStartDistance, float3 WorldNormal, float SceneDepth,
++	float3 TangentX, float3 TangentY, float MinRadius, float MaxRadius, float LightSourceRadius, float LightDistance)
++{
++	const float Rotation = GetMobileVirtualShadowMapRotation(BiasedPosition);
++	const float TanHalfAngle = LightSourceRadius * rsqrt(max(1.0f - LightSourceRadius * LightSourceRadius, 0.0001f));
++	const float SearchRadius = min(bDirectional ? 2.0f * TanHalfAngle * MobileBasePass.VirtualShadowMapPCSSSearchDistance : LightSourceRadius, MaxRadius);
++
++	float OccluderDistanceSum = 0.0f;
++	float NumOccluders = 0.0f;
++	LOOP
++	for (uint SearchIndex = 0; SearchIndex < MOBILE_VSM_PCSS_BLOCKER_TAPS; ++SearchIndex)
++	{
++		const float2 Disk = MobileVogelDisk(SearchIndex, MOBILE_VSM_PCSS_BLOCKER_TAPS, Rotation) * SearchRadius;
++		const FVirtualShadowMapSampleResult Result = SampleMobileVirtualShadowMap(bDirectional, VirtualShadowMapId, BiasedPosition + TangentX * Disk.x + TangentY * Disk.y, RayStartDistance, WorldNormal, SceneDepth);
++		if (Result.ShadowFactor < 0.5f && Result.OccluderDistance >= 0.0f)
++		{
++			OccluderDistanceSum += Result.OccluderDistance;
++			NumOccluders += 1.0f;
++		}
++	}
++	if (NumOccluders == 0.0f)
++	{
++		return 1.0f;
++	}
++
++	const float OccluderDistance = OccluderDistanceSum / NumOccluders;
++	// Similar triangles between the light, the occluder and the receiver
++	const float Penumbra = bDirectional
++		? 2.0f * TanHalfAngle * OccluderDistance
++		: 2.0f * LightSourceRadius * OccluderDistance / max(LightDistance - OccluderDistance, 1.0f);
++	const float Radius = clamp(0.5f * Penumbra, MinRadius, MaxRadius);
++
++	half Lit = 0.0f;
++	LOOP
++	for (uint TapIndex = 0; TapIndex < MOBILE_VSM_PCSS_FILTER_TAPS; ++TapIndex)
++	{
++		const float2 Disk = MobileVogelDisk(TapIndex, MOBILE_VSM_PCSS_FILTER_TAPS, Rotation) * Radius;
++		Lit += half(SampleMobileVirtualShadowMap(bDirectional, VirtualShadowMapId, BiasedPosition + TangentX * Disk.x + TangentY * Disk.y, RayStartDistance, WorldNormal, SceneDepth).ShadowFactor);
++	}
++	return Lit / half(MOBILE_VSM_PCSS_FILTER_TAPS);
++}
++
+ /**
+  * Percentage-closer filtering of a virtual shadow map in the forward base pass. Taps sit on a fixed disk in the plane facing the
+  * light, about one screen pixel's footprint apart, so the penumbra is stable from frame to frame and needs no temporal filter.
+  */
+-half MobileVirtualShadowMapFilter(bool bDirectional, int VirtualShadowMapId, float3 TranslatedWorldPosition, float3 WorldNormal, float3 ToLight, float SceneDepth)
++half MobileVirtualShadowMapFilter(bool bDirectional, int VirtualShadowMapId, float3 TranslatedWorldPosition, float3 WorldNormal, float3 ToLight, float SceneDepth, float LightSourceRadius, float LightDistance)
+ {
+ 	const float3 Up = abs(ToLight.z) < 0.99f ? float3(0, 0, 1) : float3(1, 0, 0);
+ 	const float3 TangentX = normalize(cross(ToLight, Up));
+@@ -26,6 +102,13 @@ half MobileVirtualShadowMapFilter(bool bDirectional, int VirtualShadowMapId, flo
+ 	const float3 BiasedPosition = TranslatedWorldPosition + WorldNormal * (PixelFootprint * MobileBasePass.VirtualShadowMapNormalBias);
+ 	const float RayStartDistance = PixelFootprint * MobileBasePass.VirtualShadowMapNormalBias;
+ 
++	BRANCH
++	if (MobileBasePass.VirtualShadowMapFilterMode == 1 && LightSourceRadius > 0.0f)
++	{
++		return MobileVirtualShadowMapPCSS(bDirectional, VirtualShadowMapId, BiasedPosition, RayStartDistance, WorldNormal, SceneDepth,
++			TangentX, TangentY, Radius, PixelFootprint * MobileBasePass.VirtualShadowMapPCSSMaxPenumbra, LightSourceRadius, LightDistance);
++	}
++
+ #if MOBILE_VSM_FILTER_TAPS >= 9
+ 	const float2 Taps[9] = { float2(0, 0), float2(1, 0), float2(-1, 0), float2(0, 1), float2(0, -1), float2(0.707f, 0.707f), float2(-0.707f, 0.707f), float2(0.707f, -0.707f), float2(-0.707f, -0.707f) };
+ 	const int NumTaps = 9;
+@@ -42,16 +125,7 @@ half MobileVirtualShadowMapFilter(bool bDirectional, int VirtualShadowMapId, flo
+ 	for (int TapIndex = 0; TapIndex < NumTaps; ++TapIndex)
+ 	{
+ 		const float3 TapPosition = BiasedPosition + (TangentX * Taps[TapIndex].x + TangentY * Taps[TapIndex].y) * Radius;
+-		FVirtualShadowMapSampleResult Result;
+-		if (bDirectional)
+-		{
+-			Result = SampleVirtualShadowMapDirectional(VirtualShadowMapId, TapPosition, RayStartDistance, WorldNormal, true, SceneDepth);
+-		}
+-		else
+-		{
+-			Result = SampleVirtualShadowMapLocal(VirtualShadowMapId, TapPosition, RayStartDistance, WorldNormal, true, SceneDepth);
+-		}
+-		Lit += half(Result.ShadowFactor);
++		Lit += half(SampleMobileVirtualShadowMap(bDirectional, VirtualShadowMapId, TapPosition, RayStartDistance, WorldNormal, SceneDepth).ShadowFactor);
+ 	}
+ 	return Lit / half(NumTaps);
+ }
+diff --git a/Engine/Source/Runtime/Engine/Private/LightSceneProxy.cpp b/Engine/Source/Runtime/Engine/Private/LightSceneProxy.cpp
+index df5271ca8afa..264eb68f666b 100644
+--- a/Engine/Source/Runtime/Engine/Private/LightSceneProxy.cpp
++++ b/Engine/Source/Runtime/Engine/Private/LightSceneProxy.cpp
+@@ -136,7 +136,8 @@ FLightSceneProxy::FLightSceneProxy(const FLightSceneProxyDesc& InLightDesc)
+ 	if (bCastDynamicShadow && IsMobilePlatform(SceneInterface->GetShaderPlatform()))
+ 	{
+ 		if ((GetLightType() == LightType_Point && !DoesRuntimeSupportOnePassPointLightShadows(SceneInterface->GetShaderPlatform()))
+-			|| GetLightType() == LightType_Rect
++			// Mobile shadows rect lights only through virtual shadow maps
++			|| (GetLightType() == LightType_Rect && !bUseVirtualShadowMaps)
+ 			|| (GetLightType() == LightType_Spot && !IsMobileMovableSpotlightShadowsEnabled(SceneInterface->GetShaderPlatform())))
+ 		{
+ 			bCastDynamicShadow = false;
+diff --git a/Engine/Source/Runtime/Engine/Private/RectLightSceneProxy.cpp b/Engine/Source/Runtime/Engine/Private/RectLightSceneProxy.cpp
+index ac600e31b3c4..728696dc0aa9 100644
+--- a/Engine/Source/Runtime/Engine/Private/RectLightSceneProxy.cpp
++++ b/Engine/Source/Runtime/Engine/Private/RectLightSceneProxy.cpp
+@@ -106,7 +106,8 @@ void FRectLightSceneProxy::GetLightShaderParameters(FLightRenderParameters& Ligh
+ */
+ bool FRectLightSceneProxy::GetWholeSceneProjectedShadowInitializer(const FSceneViewFamily& ViewFamily, TArray<FWholeSceneProjectedShadowInitializer, TInlineAllocator<6> >& OutInitializers) const
+ {
+-	if (ViewFamily.GetFeatureLevel() >= ERHIFeatureLevel::SM5
++	// Mobile has no rect light shadow maps, only virtual shadow maps
++	if ((ViewFamily.GetFeatureLevel() >= ERHIFeatureLevel::SM5 || UseVirtualShadowMaps())
+ 		&& GAllowPointLightCubemapShadows != 0)
+ 	{
+ 		FWholeSceneProjectedShadowInitializer& OutInitializer = *new(OutInitializers) FWholeSceneProjectedShadowInitializer;
+diff --git a/Engine/Source/Runtime/RenderCore/Private/RenderUtils.cpp b/Engine/Source/Runtime/RenderCore/Private/RenderUtils.cpp
+index b84f409046a6..1bdf6496ea6e 100644
+--- a/Engine/Source/Runtime/RenderCore/Private/RenderUtils.cpp
++++ b/Engine/Source/Runtime/RenderCore/Private/RenderUtils.cpp
+@@ -1515,9 +1515,11 @@ bool DoesPlatformSupportVirtualShadowMaps(EShaderPlatform Platform)
+ bool IsMobileVirtualShadowMapsEnabled(const FStaticShaderPlatform Platform)
+ {
+ 	static FShaderPlatformCachedIniValue<bool> MobileVirtualShadowMaps(TEXT("r.Mobile.VirtualShadowMaps"));
+-	// OpenGL lacks the pixel shader UAV atomics the shadow depth pass writes pages with
++	// OpenGL lacks the pixel shader UAV atomics the shadow depth pass writes pages with. Platforms that read GPU Scene through
++	// uniform buffer views (Vulkan ES3.1) need the batched primitive data the virtual shadow map culling does not write.
+ 	return IsMobilePlatform(Platform)
+ 		&& !IsOpenGLPlatform(Platform)
++		&& !PlatformGPUSceneUsesUniformBufferView(Platform)
+ 		&& !IsMobileDeferredShadingEnabled(Platform)
+ 		&& MobileSupportsGPUScene()
+ 		&& MobileVirtualShadowMaps.Get(Platform);
+diff --git a/Engine/Source/Runtime/Renderer/Private/MobileBasePassRendering.cpp b/Engine/Source/Runtime/Renderer/Private/MobileBasePassRendering.cpp
+index c395b3862fbc..f609311ad304 100644
+--- a/Engine/Source/Runtime/Renderer/Private/MobileBasePassRendering.cpp
++++ b/Engine/Source/Runtime/Renderer/Private/MobileBasePassRendering.cpp
+@@ -414,6 +414,7 @@ void SetupMobileBasePassUniformParameters(
+ 	BasePassParameters.MSAAEdgeDepthThreshold = FMath::Max(CVarMobileMSAAEdgeDepthThreshold.GetValueOnRenderThread(), 0.0f);
+ 	BasePassParameters.VirtualShadowMapFilterRadius = GetMobileVirtualShadowMapFilterRadius();
+ 	BasePassParameters.VirtualShadowMapNormalBias = GetMobileVirtualShadowMapNormalBias();
++	SetMobileVirtualShadowMapPCSSParameters(BasePassParameters.VirtualShadowMapFilterMode, BasePassParameters.VirtualShadowMapPCSSSearchDistance, BasePassParameters.VirtualShadowMapPCSSMaxPenumbra);
+ 	if (BasePass == EMobileBasePass::Opaque && MobileBasePassTextures.bHasProbeGI)
+ 	{
+ 		BasePassParameters.ProbeGI = MobileBasePassTextures.ProbeGI;
+diff --git a/Engine/Source/Runtime/Renderer/Private/MobileBasePassRendering.h b/Engine/Source/Runtime/Renderer/Private/MobileBasePassRendering.h
+index 9b80693b92e7..619d45b9db91 100644
+--- a/Engine/Source/Runtime/Renderer/Private/MobileBasePassRendering.h
++++ b/Engine/Source/Runtime/Renderer/Private/MobileBasePassRendering.h
+@@ -82,6 +82,9 @@ BEGIN_GLOBAL_SHADER_PARAMETER_STRUCT(FMobileBasePassUniformParameters, )
+ 	SHADER_PARAMETER(uint32, NumClusteredDecals)
+ 	SHADER_PARAMETER(float, VirtualShadowMapFilterRadius)
+ 	SHADER_PARAMETER(float, VirtualShadowMapNormalBias)
++	SHADER_PARAMETER(uint32, VirtualShadowMapFilterMode)
++	SHADER_PARAMETER(float, VirtualShadowMapPCSSSearchDistance)
++	SHADER_PARAMETER(float, VirtualShadowMapPCSSMaxPenumbra)
+ 	SHADER_PARAMETER_STRUCT(FMobileProbeGIUniformParameters, ProbeGI)
+ 	SHADER_PARAMETER(uint32, bApplyHalfResLocalFogToSkyMeshes)
+ 	SHADER_PARAMETER_RDG_TEXTURE(Texture2D, HalfResLocalFogVolumeViewTexture)
+diff --git a/Engine/Source/Runtime/Renderer/Private/MobileVirtualShadowMaps.cpp b/Engine/Source/Runtime/Renderer/Private/MobileVirtualShadowMaps.cpp
+index 70da5da0a465..868a52562b71 100644
+--- a/Engine/Source/Runtime/Renderer/Private/MobileVirtualShadowMaps.cpp
++++ b/Engine/Source/Runtime/Renderer/Private/MobileVirtualShadowMaps.cpp
+@@ -12,6 +12,7 @@
+ #include "SceneRendering.h"
+ #include "SceneTextures.h"
+ #include "ScenePrivate.h"
++#include "ShaderPlatformCachedIniValue.h"
+ #include "Shadows/ShadowSceneRenderer.h"
+ #include "VirtualShadowMaps/VirtualShadowMapArray.h"
+ #include "VirtualShadowMaps/VirtualShadowMapCacheManager.h"
+@@ -35,6 +36,33 @@ static TAutoConsoleVariable<float> CVarMobileVirtualShadowMapsNormalBias(
+ 	TEXT("How far each shadow lookup steps off the receiver, along its normal and towards the light, in screen pixels at the receiver. Raise it if surfaces shadow themselves in stripes."),
+ 	ECVF_Scalability | ECVF_RenderThreadSafe);
+ 
++static TAutoConsoleVariable<int32> CVarMobileVirtualShadowMapsFilter(
++	TEXT("r.Mobile.VirtualShadowMaps.Filter"),
++	0,
++	TEXT("Mobile forward virtual shadow map filter.\n")
++	TEXT(" 0: PCF, a fixed radius (r.Mobile.VirtualShadowMaps.FilterRadius) and FilterTaps lookups.\n")
++	TEXT(" 1: PCSS, contact-hardening soft shadows sized by the light's source angle or radius. 8 blocker lookups plus 16 filter lookups where a blocker is found."),
++	ECVF_Scalability | ECVF_RenderThreadSafe);
++
++static TAutoConsoleVariable<float> CVarMobileVirtualShadowMapsPCSSSearchDistance(
++	TEXT("r.Mobile.VirtualShadowMaps.PCSS.SearchDistance"),
++	2000.0f,
++	TEXT("Farthest occluder, in world units, whose penumbra the sun's PCSS blocker search covers. Further occluders get a narrower penumbra than they should."),
++	ECVF_Scalability | ECVF_RenderThreadSafe);
++
++static TAutoConsoleVariable<float> CVarMobileVirtualShadowMapsPCSSMaxPenumbra(
++	TEXT("r.Mobile.VirtualShadowMaps.PCSS.MaxPenumbra"),
++	32.0f,
++	TEXT("Widest PCSS penumbra radius, in screen pixels at the receiver. Wider ones are clamped, which bounds how far the fixed taps spread."),
++	ECVF_Scalability | ECVF_RenderThreadSafe);
++
++void SetMobileVirtualShadowMapPCSSParameters(uint32& OutFilterMode, float& OutSearchDistance, float& OutMaxPenumbra)
++{
++	OutFilterMode = CVarMobileVirtualShadowMapsFilter.GetValueOnRenderThread() == 1 ? 1u : 0u;
++	OutSearchDistance = FMath::Max(CVarMobileVirtualShadowMapsPCSSSearchDistance.GetValueOnRenderThread(), 0.0f);
++	OutMaxPenumbra = FMath::Max(CVarMobileVirtualShadowMapsPCSSMaxPenumbra.GetValueOnRenderThread(), 1.0f);
++}
++
+ float GetMobileVirtualShadowMapNormalBias()
+ {
+ 	return FMath::Max(CVarMobileVirtualShadowMapsNormalBias.GetValueOnRenderThread(), 0.0f);
+@@ -47,6 +75,15 @@ float GetMobileVirtualShadowMapFilterRadius()
+ 
+ void CheckMobileVirtualShadowMapsRHI(EShaderPlatform Platform)
+ {
++	static bool bWarnedUniformBufferView = false;
++	static FShaderPlatformCachedIniValue<bool> MobileVirtualShadowMaps(TEXT("r.Mobile.VirtualShadowMaps"));
++	if (!bWarnedUniformBufferView && IsMobilePlatform(Platform) && PlatformGPUSceneUsesUniformBufferView(Platform) && MobileVirtualShadowMaps.Get(Platform))
++	{
++		bWarnedUniformBufferView = true;
++		UE_LOG(LogRenderer, Warning, TEXT("r.Mobile.VirtualShadowMaps is off on %s, whose GPU Scene is read through uniform buffers, which virtual shadow maps do not support. Shadows fall back to shadow maps."),
++			*LegacyShaderPlatformToShaderFormat(Platform).ToString());
++	}
++
+ 	if (IsMobileVirtualShadowMapsEnabled(Platform) && IsD3DPlatform(Platform) && RHIGetInterfaceType() == ERHIInterfaceType::D3D11)
+ 	{
+ 		UE_LOG(LogRenderer, Fatal, TEXT("r.Mobile.VirtualShadowMaps compiles shadow shaders with DXC, which DirectX 11 cannot run. Use DirectX 12 (-d3d12, or DefaultGraphicsRHI_DX12), or turn r.Mobile.VirtualShadowMaps off."));
+diff --git a/Engine/Source/Runtime/Renderer/Private/MobileVirtualShadowMaps.h b/Engine/Source/Runtime/Renderer/Private/MobileVirtualShadowMaps.h
+index b2d18dff75dc..a29cee0dc73e 100644
+--- a/Engine/Source/Runtime/Renderer/Private/MobileVirtualShadowMaps.h
++++ b/Engine/Source/Runtime/Renderer/Private/MobileVirtualShadowMaps.h
+@@ -16,6 +16,9 @@ float GetMobileVirtualShadowMapFilterRadius();
+ /** r.Mobile.VirtualShadowMaps.NormalBias: how far lookups step off the receiver, in screen pixels at the receiver. */
+ float GetMobileVirtualShadowMapNormalBias();
+ 
++/** r.Mobile.VirtualShadowMaps.Filter and the PCSS settings: filter mode (0 PCF, 1 PCSS), blocker search distance in world units, and widest penumbra in screen pixels. */
++void SetMobileVirtualShadowMapPCSSParameters(uint32& OutFilterMode, float& OutSearchDistance, float& OutMaxPenumbra);
++
+ /** Stops with an explanation when r.Mobile.VirtualShadowMaps runs on D3D11, which cannot load the DXC-compiled shaders it needs. */
+ void CheckMobileVirtualShadowMapsRHI(EShaderPlatform Platform);
+ 

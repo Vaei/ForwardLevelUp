@@ -48,6 +48,9 @@ You need a UE 5.8 source build, and a project using the mobile renderer (`bPrefe
    git apply <this repo>/Patches/15-ssr-velocity.patch
    git apply <this repo>/Patches/16-virtual-shadow-maps.patch
    git apply <this repo>/Patches/17-probe-gi.patch
+   git apply <this repo>/Patches/18-probe-gi-relocation.patch
+   git apply <this repo>/Patches/19-probe-gi-surface-colors.patch
+   git apply <this repo>/Patches/20-vsm-pcss.patch
    ```
 
 2. Build the editor. The first launch recompiles every material.
@@ -82,8 +85,9 @@ Each needs the setup above.
 - **Tonemap subpass on Vulkan devices:** with `r.Mobile.TonemapSubpass=1`, set `r.Mobile.TonemapSubpass.Resolve=2` to tonemap each sample before averaging, so bright edges stop stair-stepping. The PC resolve already does the equivalent.
 - **World normals in post-process materials:** `r.Mobile.Forward.NormalTarget=1`. SceneTexture WorldNormal then works in post-process materials.
 - **Reflections that follow moving objects:** `r.Mobile.ScreenSpaceReflections.Velocity=1`, with screen-space reflections on. Renders velocities without TAA, MSAA included, so a reflected car stays under the car. Not on OpenGL.
-- **Virtual shadow maps:** `r.Mobile.VirtualShadowMaps=1`, `r.Shadow.Virtual.Enable=1` and `r.Mobile.SupportGPUScene=1`. Replaces cascaded and local-light shadow maps for movable lights; no Nanite needed. On Windows it needs DirectX 12 (`DefaultGraphicsRHI_DX12`, or `-d3d12`). Not on OpenGL.
-- **Probe GI:** `r.Mobile.ProbeGI=1`, with `r.GenerateMeshDistanceFields=True`. Probes around the camera trace the global distance field and replace the sky light's diffuse inside their grid. Ray hits on screen take last frame's lit colour, which needs `r.Mobile.ScreenSpaceReflections=1`; hits off screen use the sun, sky and up to 64 nearby point, spot and rect lights.
+- **Virtual shadow maps:** `r.Mobile.VirtualShadowMaps=1`, `r.Shadow.Virtual.Enable=1` and `r.Mobile.SupportGPUScene=1`. Replaces cascaded and local-light shadow maps for movable lights; no Nanite needed. Rect lights cast shadows too. On Windows it needs DirectX 12 (`DefaultGraphicsRHI_DX12`, or `-d3d12`); DirectX 11 is not supported. On OpenGL and Vulkan it stays off and lights keep shadow maps.
+- **Contact-hardening soft shadows:** `r.Mobile.VirtualShadowMaps.Filter=1`, with virtual shadow maps on. Shadows are hard where an object touches the ground and soften with distance from it. The width follows each light's **Source Angle** (directional), **Source Radius** (point and spot) or **Source Width** and **Source Height** (rect); a light with zero keeps the fixed filter.
+- **Probe GI:** `r.Mobile.ProbeGI=1`, with `r.GenerateMeshDistanceFields=True`. Probes around the camera trace the global distance field and replace the sky light's diffuse inside their grid. Ray hits on screen take last frame's lit colour, which needs `r.Mobile.ScreenSpaceReflections=1`; hits off screen use the sun, sky and up to 64 nearby point, spot and rect lights, in the colour of the mesh they hit when `r.Mobile.SupportGPUScene=1`.
 
 ## Troubleshoot
 
@@ -106,12 +110,17 @@ Each needs the setup above.
 - **Unlit or translucent materials do not get the edge fixes or AO.** Only opaque and masked lit materials do.
 - **Velocity, virtual shadow map and probe GI settings ignored.** `r.Mobile.ScreenSpaceReflections.Velocity`, `r.Mobile.VirtualShadowMaps`, `r.Mobile.VirtualShadowMaps.FilterTaps` and `r.Mobile.ProbeGI` are read only: set them in the ini and restart. They recompile materials.
 - **Fatal error "r.Mobile.VirtualShadowMaps compiles shadow shaders with DXC, which DirectX 11 cannot run".** Switch the project to DirectX 12, or turn `r.Mobile.VirtualShadowMaps` off.
+- **Warning "r.Mobile.VirtualShadowMaps is off on SF_VULKAN_ES31".** Vulkan reads GPU Scene through uniform buffers, which virtual shadow maps do not support, so shadows use shadow maps. Use DirectX 12 on Windows; on Android, virtual shadow maps are unavailable.
 - **No virtual shadows.** `ProfileGPU` shows `VirtualShadowMapMarkPages` when they run. Check `r.Shadow.Virtual.Enable=1`, `r.Mobile.SupportGPUScene=1`, and that the light is Movable.
 - **Surfaces shadow themselves in stripes.** Raise `r.Mobile.VirtualShadowMaps.NormalBias`.
-- **First launch with virtual shadow maps takes minutes.** Their shaders compile once for the mobile shader platform, then come from the DDC.
+- **Soft shadows look dithered.** The PCSS taps rotate per pixel, without temporal filtering. Lower `r.Mobile.VirtualShadowMaps.PCSS.MaxPenumbra`, or the light's source size.
+- **Soft shadows stay hard far from the object.** Raise `r.Mobile.VirtualShadowMaps.PCSS.SearchDistance` past the tallest occluder, and `r.Mobile.VirtualShadowMaps.PCSS.MaxPenumbra`.
+- **First launch with virtual shadow maps takes minutes.** Their shaders compile once for the mobile shader platform, then come from the DDC. From an empty DDC on a 32-thread PC, a small level took about 9 minutes against 2.5 without them.
 - **Probe GI does nothing.** `ProfileGPU` shows `MobileProbeGI` when it runs. It needs mesh distance fields; `r.Mobile.ProbeGI.Intensity` above 0.
 - **Interiors went dark with probe GI.** Expected: the sky light no longer leaks through walls and roofs. Light reaches the probes through openings and from lights inside.
-- **Blotches of light on walls with probe GI.** Raise `r.Mobile.ProbeGI.RaysPerProbe` or `r.Mobile.ProbeGI.Hysteresis`, or lower `r.Mobile.ProbeGI.Spacing`.
+- **Spots of light on walls with probe GI.** Rays that land beside a bright lamp leave them. Lower `r.Mobile.ProbeGI.MaxRayLuminance`.
+- **Blotches or a dark band along the foot of walls with probe GI.** Check `r.Mobile.ProbeGI.Relocation=1`. Otherwise raise `r.Mobile.ProbeGI.RaysPerProbe` or `r.Mobile.ProbeGI.Hysteresis`, or lower `r.Mobile.ProbeGI.Spacing`.
+- **Off-screen bounce light is grey with probe GI.** Surface colours need `r.Mobile.SupportGPUScene=1`. A material's colour is read from its Base Colour input: constants, vector and scalar parameters, and texture samples, combined by Multiply, Add, Subtract and Lerp. Anything else, and material attributes, falls back to `r.Mobile.ProbeGI.Albedo`.
 - **Light leaks through a thin wall with probe GI.** Walls thinner than a global distance field voxel do not stop probe rays. Thicken the wall or its distance field resolution.
 
 ## Tune it
@@ -137,13 +146,20 @@ Each needs the setup above.
 | `r.Mobile.VirtualShadowMaps.FilterRadius` | 1.5 | Shadow edge softness, in screen pixels at the receiver. 0 is hard. |
 | `r.Mobile.VirtualShadowMaps.FilterTaps` | 5 | Lookups per light per pixel: 1, 5 or 9. Read only. |
 | `r.Mobile.VirtualShadowMaps.NormalBias` | 2 | How far lookups step off the surface, in screen pixels. Raise it if surfaces shadow themselves. |
+| `r.Mobile.VirtualShadowMaps.Filter` | 0 | 0 fixed-width filter, 1 contact-hardening soft shadows (PCSS): 8 lookups, plus 16 near a shadow. |
+| `r.Mobile.VirtualShadowMaps.PCSS.SearchDistance` | 2000 | Farthest sun occluder, in world units, that gets its full penumbra. |
+| `r.Mobile.VirtualShadowMaps.PCSS.MaxPenumbra` | 32 | Widest soft shadow edge, in screen pixels. |
 | `r.Mobile.ProbeGI.Spacing` | 200 | World distance between probes. About 0.24 ms for the whole update at the defaults. |
 | `r.Mobile.ProbeGI.GridSizeXY` / `.GridSizeZ` | 32 / 16 | Probes across and up. The grid covers this times the spacing, centred on the camera. |
 | `r.Mobile.ProbeGI.RaysPerProbe` | 64 | Rays per probe update, 32 to 256. More is smoother and costs more. |
 | `r.Mobile.ProbeGI.UpdateInterval` | 4 | Each probe updates every this many frames. |
 | `r.Mobile.ProbeGI.Hysteresis` | 0.95 | How much of its last value a probe keeps per update. Lower follows moving lights faster. |
 | `r.Mobile.ProbeGI.Intensity` | 1 | Scale on the probe light. 0 restores the sky light. |
-| `r.Mobile.ProbeGI.Albedo` | 0.3 | Colour assumed for off-screen ray hits. |
+| `r.Mobile.ProbeGI.Albedo` | 0.3 | Colour for off-screen ray hits whose mesh colour is unknown. |
+| `r.Mobile.ProbeGI.SurfaceColors` | 1 | Whether off-screen hits take their mesh's base colour. Read only. |
+| `r.Mobile.ProbeGI.MaxRayLuminance` | 8 | Brightest a ray hit can be, in multiples of white on screen. Lower removes spots near lamps. |
+| `r.Mobile.ProbeGI.Relocation` / `.RelocationDistance` | 1 / 0.3 | Moves probes out of walls and floors, keeping this fraction of the spacing from them. |
+| `r.Mobile.ProbeGI.NormalBias` / `.ViewBias` | 0.2 / 0.1 | How far off a surface, along its normal and towards the camera, it reads the probes, as a fraction of the spacing. |
 | `r.Mobile.ProbeGI.MaxTraceDistance` | 10000 | How far a probe ray goes before it counts as sky. |
 | `r.Mobile.ProbeGI.ScreenRadiance` | 1 | Whether on-screen hits take last frame's lit colour. |
 | `r.Mobile.ProbeGI.LocalLights` / `.LocalLightShadows` | 64 / 1 | Local lights that light off-screen hits, and whether they are shadowed through the distance field. |

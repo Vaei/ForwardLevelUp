@@ -1,0 +1,668 @@
+diff --git a/Engine/Shaders/Private/MobileProbeGI.usf b/Engine/Shaders/Private/MobileProbeGI.usf
+index 22c6989d7c06..8e6b6638eeec 100644
+--- a/Engine/Shaders/Private/MobileProbeGI.usf
++++ b/Engine/Shaders/Private/MobileProbeGI.usf
+@@ -70,6 +70,8 @@ float3 GetRayDirection(uint RayIndex)
+ #if SHADER_TRACE || SHADER_FINALIZE
+ #include "DistanceField/GlobalDistanceFieldShared.ush"
+ #include "DistanceField/GlobalDistanceFieldUtils.ush"
++#include "DistanceField/GlobalDistanceFieldObjectGrid.ush"
++#include "GammaCorrectionCommon.ush"
+ #endif
+ 
+ // Backface ray distances are stored shortened by this, so the distance moments do not see far through walls
+@@ -106,6 +108,55 @@ float PrevPreExposureInv;
+ uint bScreenRadiance;
+ float MaxRayLuminance;
+ 
++StructuredBuffer<uint4> GlobalDistanceFieldPageObjectGridBuffer;
++uint GlobalDistanceFieldPageObjectGridBufferSize;
++Buffer<uint> InstanceBaseColors;
++uint NumInstanceBaseColors;
++
++/** Base colour of the mesh nearest a hit, from the instances the global distance field object grid lists for its cell, nearest first. */
++float3 GetHitBaseColor(float3 HitPosition, float3 HitNormal, uint ClipmapIndex)
++{
++	if (GlobalDistanceFieldPageObjectGridBufferSize == 0)
++	{
++		return DefaultAlbedo;
++	}
++
++	// The cell just outside the surface, where the grid ranks the meshes by distance as Lumen's surface cache lookup does
++	const float VoxelExtent = GlobalVolumeTranslatedCenterAndExtent[ClipmapIndex].w * GlobalVolumeTexelSize;
++	const float3 ClipmapVolumeUV = ComputeGlobalUV(HitPosition + HitNormal * VoxelExtent, ClipmapIndex);
++	const FGlobalDistanceFieldPage Page = GetGlobalDistanceFieldPage(ClipmapVolumeUV, ClipmapIndex);
++	if (!Page.bValid)
++	{
++		return DefaultAlbedo;
++	}
++
++	const float3 PageTableCoord = saturate(ClipmapVolumeUV) * GlobalDistanceFieldClipmapSizeInPages;
++	const uint3 CellCoordInPage = frac(PageTableCoord) * DISTANCE_FIELD_OBJECT_GRID_PAGE_RESOLUTION;
++	const uint CellIndex = DISTANCE_FIELD_OBJECT_GRID_PAGE_STRIDE * Page.PageIndex + ZOrder3DEncode(CellCoordInPage, log2(DISTANCE_FIELD_OBJECT_GRID_PAGE_RESOLUTION));
++	if (CellIndex >= GlobalDistanceFieldPageObjectGridBufferSize)
++	{
++		return DefaultAlbedo;
++	}
++
++	const uint4 Cell = GlobalDistanceFieldPageObjectGridBuffer[CellIndex];
++	for (uint IndexInCell = 0; IndexInCell < DISTANCE_FIELD_OBJECT_GRID_CELL_SIZE; ++IndexInCell)
++	{
++		const FObjectGridCellIndex Entry = UnpackObjectGridCellIndex(Cell[IndexInCell]);
++		if (!Entry.bValid)
++		{
++			break;
++		}
++		const uint Packed = Entry.GPUSceneInstanceIndex < NumInstanceBaseColors ? InstanceBaseColors[Entry.GPUSceneInstanceIndex] : 0;
++		// Alpha is zero for meshes whose material colour is unknown; the next nearest mesh may know better
++		if ((Packed >> 24) != 0)
++		{
++			const float3 Encoded = float3((Packed >> 16) & 0xFF, (Packed >> 8) & 0xFF, Packed & 0xFF) / 255.0f;
++			return sRGBToLinear(Encoded);
++		}
++	}
++	return DefaultAlbedo;
++}
++
+ /** Caps a hit's radiance at a multiple of white on screen, so the odd ray landing beside a bright light does not leave a spot in the probe history. */
+ float3 ClampRayRadiance(float3 Radiance)
+ {
+@@ -259,7 +310,7 @@ void TraceCS(uint3 GroupId : SV_GroupID, uint GroupIndex : SV_GroupIndex)
+ 				// Lambertian hit of unknown colour: direct sun and local lights, plus last frame's probes for further bounces
+ 				const float3 Direct = SunColor * NoL * SunVisibility + GetLocalLightIrradiance(HitPosition, HitNormal, ShadowOrigin);
+ 				const float3 Bounce = SampleMobileProbeGI(HitPosition, HitNormal, -Direction).rgb;
+-				Radiance = DefaultAlbedo * (Direct / PI + Bounce);
++				Radiance = GetHitBaseColor(HitPosition, HitNormal, HitClipmapIndex) * (Direct / PI + Bounce);
+ 			}
+ 			Result = float4(ClampRayRadiance(Radiance), HitTime);
+ 		}
+diff --git a/Engine/Source/Runtime/Engine/Private/Materials/MaterialInterface.cpp b/Engine/Source/Runtime/Engine/Private/Materials/MaterialInterface.cpp
+index 703e77c59159..1508b98d1dc9 100644
+--- a/Engine/Source/Runtime/Engine/Private/Materials/MaterialInterface.cpp
++++ b/Engine/Source/Runtime/Engine/Private/Materials/MaterialInterface.cpp
+@@ -1094,6 +1094,8 @@ void UMaterialInterface::PostDuplicate(bool bDuplicateForPIE)
+ #if WITH_EDITOR
+ void UMaterialInterface::PostEditChangeProperty(FPropertyChangedEvent& PropertyChangedEvent)
+ {
++	bProbeGIBaseColorValid = false;
++
+ 	// flush the lighting guid on all changes
+ 	SetLightingGuid();
+ 
+@@ -2526,6 +2528,12 @@ bool UMaterialInterface::UseAnyStreamingTexture() const
+ void UMaterialInterface::PreSave(FObjectPreSaveContext ObjectSaveContext)
+ {
+ 	Super::PreSave(ObjectSaveContext);
++	// Saved for cooked builds, which cannot read the material graph
++	static const IConsoleVariable* CVarMobileProbeGI = IConsoleManager::Get().FindConsoleVariable(TEXT("r.Mobile.ProbeGI"));
++	if (CVarMobileProbeGI && CVarMobileProbeGI->GetInt() != 0)
++	{
++		GetProbeGIBaseColor();
++	}
+ 	const ITargetPlatform* TargetPlatform = ObjectSaveContext.GetTargetPlatform();
+ 	if (TargetPlatform && TargetPlatform->RequiresCookedData())
+ 	{
+diff --git a/Engine/Source/Runtime/Engine/Private/Materials/MaterialProbeGIBaseColor.cpp b/Engine/Source/Runtime/Engine/Private/Materials/MaterialProbeGIBaseColor.cpp
+new file mode 100644
+index 000000000000..73be7d8d52f6
+--- /dev/null
++++ b/Engine/Source/Runtime/Engine/Private/Materials/MaterialProbeGIBaseColor.cpp
+@@ -0,0 +1,284 @@
++// Copyright (c) 2026 Jared Taylor.
++
++#include "Materials/MaterialInterface.h"
++
++#include "Materials/MaterialInstance.h"
++#include "ProfilingDebugging/CpuProfilerTrace.h"
++
++#if WITH_EDITORONLY_DATA
++#include "Engine/Texture.h"
++#include "ImageCore.h"
++#include "Materials/Material.h"
++#include "Materials/MaterialExpressionAdd.h"
++#include "Materials/MaterialExpressionConstant.h"
++#include "Materials/MaterialExpressionConstant2Vector.h"
++#include "Materials/MaterialExpressionConstant3Vector.h"
++#include "Materials/MaterialExpressionConstant4Vector.h"
++#include "Materials/MaterialExpressionLinearInterpolate.h"
++#include "Materials/MaterialExpressionMultiply.h"
++#include "Materials/MaterialExpressionReroute.h"
++#include "Materials/MaterialExpressionScalarParameter.h"
++#include "Materials/MaterialExpressionSubtract.h"
++#include "Materials/MaterialExpressionTextureObjectParameter.h"
++#include "Materials/MaterialExpressionTextureSample.h"
++#include "Materials/MaterialExpressionTextureSampleParameter.h"
++#include "Materials/MaterialExpressionVectorParameter.h"
++#include "Misc/ScopeLock.h"
++#include "UObject/ObjectKey.h"
++
++namespace MaterialProbeGIBaseColor
++{
++	/** Texture averages, keyed by texture and invalidated when its source changes. */
++	struct FTextureAverage
++	{
++		FGuid SourceId;
++		FLinearColor Average = FLinearColor::Transparent;
++	};
++	static TMap<FObjectKey, FTextureAverage> TextureAverages;
++	static FCriticalSection TextureAveragesLock;
++
++	/** Mean linear colour of a texture's source, from a downsized copy. Alpha 0 when the source is unavailable. */
++	static FLinearColor GetTextureAverage(UTexture* Texture)
++	{
++		TRACE_CPUPROFILER_EVENT_SCOPE(MaterialProbeGIBaseColor::GetTextureAverage);
++
++		if (!Texture || !Texture->Source.IsValid())
++		{
++			return FLinearColor::Transparent;
++		}
++
++		const FGuid SourceId = Texture->Source.GetId();
++		FScopeLock Lock(&TextureAveragesLock);
++		if (const FTextureAverage* Cached = TextureAverages.Find(FObjectKey(Texture)); Cached && Cached->SourceId == SourceId)
++		{
++			return Cached->Average;
++		}
++
++		FLinearColor Average = FLinearColor::Transparent;
++		FImage Image;
++		if (Texture->Source.GetMipImage(Image, 0))
++		{
++			FImageCore::ResizeImageInPlace(Image, FMath::Min(Image.SizeX, 64), FMath::Min(Image.SizeY, 64), ERawImageFormat::RGBA32F, EGammaSpace::Linear);
++			Average = FImageCore::ComputeImageLinearAverage(Image);
++			Average.A = 1.0f;
++		}
++		TextureAverages.Add(FObjectKey(Texture), { SourceId, Average });
++		return Average;
++	}
++
++	/** Folds the base colour graph into one average colour, for the expressions whose average follows from their inputs' averages. */
++	class FEvaluator
++	{
++	public:
++		explicit FEvaluator(UMaterialInterface* InParameterSource) : ParameterSource(InParameterSource) {}
++
++		bool Evaluate(const FExpressionInput& Input, float DefaultValue, FLinearColor& OutValue)
++		{
++			if (!Input.Expression)
++			{
++				OutValue = FLinearColor(DefaultValue, DefaultValue, DefaultValue, DefaultValue);
++				return true;
++			}
++			if (++Depth > 32)
++			{
++				return false;
++			}
++
++			FLinearColor Value;
++			const bool bResult = EvaluateExpression(Input.Expression, Input.OutputIndex, Value);
++			--Depth;
++			if (!bResult)
++			{
++				return false;
++			}
++
++			if (Input.Mask)
++			{
++				Value = ApplyMask(Value, Input.MaskR, Input.MaskG, Input.MaskB, Input.MaskA);
++			}
++			OutValue = Value;
++			return true;
++		}
++
++	private:
++		UMaterialInterface* ParameterSource;
++		int32 Depth = 0;
++
++		/** Masked channels in order; a single channel spreads to all four, as a scalar does. */
++		static FLinearColor ApplyMask(const FLinearColor& Value, int32 MaskR, int32 MaskG, int32 MaskB, int32 MaskA)
++		{
++			float Channels[4];
++			int32 NumChannels = 0;
++			if (MaskR) { Channels[NumChannels++] = Value.R; }
++			if (MaskG) { Channels[NumChannels++] = Value.G; }
++			if (MaskB) { Channels[NumChannels++] = Value.B; }
++			if (MaskA) { Channels[NumChannels++] = Value.A; }
++			if (NumChannels == 1)
++			{
++				return FLinearColor(Channels[0], Channels[0], Channels[0], Channels[0]);
++			}
++			FLinearColor Result = FLinearColor::Black;
++			for (int32 Index = 0; Index < NumChannels; ++Index)
++			{
++				Result.Component(Index) = Channels[Index];
++			}
++			return Result;
++		}
++
++		bool EvaluateExpression(UMaterialExpression* Expression, int32 OutputIndex, FLinearColor& OutValue)
++		{
++			FLinearColor Value;
++			if (!EvaluateUnmasked(Expression, Value))
++			{
++				return false;
++			}
++			const TArray<FExpressionOutput>& Outputs = Expression->GetOutputs();
++			if (Outputs.IsValidIndex(OutputIndex) && Outputs[OutputIndex].Mask)
++			{
++				const FExpressionOutput& Output = Outputs[OutputIndex];
++				Value = ApplyMask(Value, Output.MaskR, Output.MaskG, Output.MaskB, Output.MaskA);
++			}
++			OutValue = Value;
++			return true;
++		}
++
++		UTexture* GetTexture(UMaterialExpressionTextureSample* Sample)
++		{
++			UTexture* Texture = Sample->Texture;
++			FName ParameterName;
++			if (UMaterialExpressionTextureSampleParameter* Parameter = Cast<UMaterialExpressionTextureSampleParameter>(Sample))
++			{
++				ParameterName = Parameter->ParameterName;
++			}
++			else if (UMaterialExpressionTextureBase* Object = Cast<UMaterialExpressionTextureBase>(Sample->TextureObject.Expression))
++			{
++				Texture = Object->Texture;
++				if (UMaterialExpressionTextureObjectParameter* ObjectParameter = Cast<UMaterialExpressionTextureObjectParameter>(Object))
++				{
++					ParameterName = ObjectParameter->ParameterName;
++				}
++			}
++			else if (Sample->TextureObject.Expression)
++			{
++				return nullptr;
++			}
++
++			UTexture* Override = nullptr;
++			if (!ParameterName.IsNone() && ParameterSource->GetTextureParameterValue(FHashedMaterialParameterInfo(ParameterName), Override) && Override)
++			{
++				Texture = Override;
++			}
++			return Texture;
++		}
++
++		bool EvaluateUnmasked(UMaterialExpression* Expression, FLinearColor& OutValue)
++		{
++			if (const UMaterialExpressionConstant* Constant = Cast<UMaterialExpressionConstant>(Expression))
++			{
++				OutValue = FLinearColor(Constant->R, Constant->R, Constant->R, Constant->R);
++				return true;
++			}
++			if (const UMaterialExpressionConstant2Vector* Constant2 = Cast<UMaterialExpressionConstant2Vector>(Expression))
++			{
++				OutValue = FLinearColor(Constant2->R, Constant2->G, 0.0f, 0.0f);
++				return true;
++			}
++			if (const UMaterialExpressionConstant3Vector* Constant3 = Cast<UMaterialExpressionConstant3Vector>(Expression))
++			{
++				OutValue = Constant3->Constant;
++				return true;
++			}
++			if (const UMaterialExpressionConstant4Vector* Constant4 = Cast<UMaterialExpressionConstant4Vector>(Expression))
++			{
++				OutValue = Constant4->Constant;
++				return true;
++			}
++			if (const UMaterialExpressionVectorParameter* VectorParameter = Cast<UMaterialExpressionVectorParameter>(Expression))
++			{
++				OutValue = VectorParameter->DefaultValue;
++				ParameterSource->GetVectorParameterValue(FHashedMaterialParameterInfo(VectorParameter->ParameterName), OutValue);
++				return true;
++			}
++			if (const UMaterialExpressionScalarParameter* ScalarParameter = Cast<UMaterialExpressionScalarParameter>(Expression))
++			{
++				float Value = ScalarParameter->DefaultValue;
++				ParameterSource->GetScalarParameterValue(FHashedMaterialParameterInfo(ScalarParameter->ParameterName), Value);
++				OutValue = FLinearColor(Value, Value, Value, Value);
++				return true;
++			}
++			if (UMaterialExpressionTextureSample* Sample = Cast<UMaterialExpressionTextureSample>(Expression))
++			{
++				OutValue = GetTextureAverage(GetTexture(Sample));
++				return OutValue.A > 0.0f;
++			}
++			if (UMaterialExpressionMultiply* Multiply = Cast<UMaterialExpressionMultiply>(Expression))
++			{
++				FLinearColor A, B;
++				return Evaluate(Multiply->A, Multiply->ConstA, A) && Evaluate(Multiply->B, Multiply->ConstB, B) && (OutValue = A * B, true);
++			}
++			if (UMaterialExpressionAdd* Add = Cast<UMaterialExpressionAdd>(Expression))
++			{
++				FLinearColor A, B;
++				return Evaluate(Add->A, Add->ConstA, A) && Evaluate(Add->B, Add->ConstB, B) && (OutValue = A + B, true);
++			}
++			if (UMaterialExpressionSubtract* Subtract = Cast<UMaterialExpressionSubtract>(Expression))
++			{
++				FLinearColor A, B;
++				return Evaluate(Subtract->A, Subtract->ConstA, A) && Evaluate(Subtract->B, Subtract->ConstB, B) && (OutValue = A - B, true);
++			}
++			if (UMaterialExpressionLinearInterpolate* Lerp = Cast<UMaterialExpressionLinearInterpolate>(Expression))
++			{
++				FLinearColor A, B, Alpha;
++				return Evaluate(Lerp->A, Lerp->ConstA, A) && Evaluate(Lerp->B, Lerp->ConstB, B) && Evaluate(Lerp->Alpha, Lerp->ConstAlpha, Alpha)
++					&& (OutValue = A + (B - A) * Alpha.R, true);
++			}
++			if (UMaterialExpressionReroute* Reroute = Cast<UMaterialExpressionReroute>(Expression))
++			{
++				return Evaluate(Reroute->Input, 0.0f, OutValue);
++			}
++			return false;
++		}
++	};
++
++	static FLinearColor Compute(UMaterialInterface* Material)
++	{
++		TRACE_CPUPROFILER_EVENT_SCOPE(MaterialProbeGIBaseColor::Compute);
++
++		UMaterial* BaseMaterial = Material->GetMaterial();
++		const UMaterialEditorOnlyData* EditorOnly = BaseMaterial ? BaseMaterial->GetEditorOnlyData() : nullptr;
++		if (!EditorOnly || BaseMaterial->bUseMaterialAttributes)
++		{
++			return FLinearColor::Transparent;
++		}
++
++		FLinearColor BaseColor;
++		if (!FEvaluator(Material).Evaluate(EditorOnly->BaseColor, 0.0f, BaseColor))
++		{
++			return FLinearColor::Transparent;
++		}
++		BaseColor = FLinearColor(FMath::Clamp(BaseColor.R, 0.0f, 1.0f), FMath::Clamp(BaseColor.G, 0.0f, 1.0f), FMath::Clamp(BaseColor.B, 0.0f, 1.0f), 1.0f);
++		return BaseColor;
++	}
++}
++#endif // WITH_EDITORONLY_DATA
++
++FLinearColor UMaterialInterface::GetProbeGIBaseColor()
++{
++#if WITH_EDITORONLY_DATA
++	// Evaluating reads the material graph and texture sources, which only the game thread may do
++	if (!bProbeGIBaseColorValid && IsInGameThread())
++	{
++		ProbeGIBaseColor = MaterialProbeGIBaseColor::Compute(this);
++		bProbeGIBaseColorValid = true;
++	}
++#endif
++	// Dynamic instances are never saved, so cooked builds fall back to the colour saved with their parent
++	if (ProbeGIBaseColor.A == 0.0f)
++	{
++		if (UMaterialInstance* Instance = Cast<UMaterialInstance>(this); Instance && Instance->Parent)
++		{
++			return Instance->Parent->GetProbeGIBaseColor();
++		}
++	}
++	return ProbeGIBaseColor;
++}
+diff --git a/Engine/Source/Runtime/Engine/Private/PrimitiveSceneProxy.cpp b/Engine/Source/Runtime/Engine/Private/PrimitiveSceneProxy.cpp
+index 9a279492a8b6..83582de3b61a 100644
+--- a/Engine/Source/Runtime/Engine/Private/PrimitiveSceneProxy.cpp
++++ b/Engine/Source/Runtime/Engine/Private/PrimitiveSceneProxy.cpp
+@@ -31,6 +31,9 @@
+ 
+ #if WITH_EDITOR
+ #include "ObjectCacheEventSink.h"
++#include "ProfilingDebugging/CpuProfilerTrace.h"
++
++static FColor ComputeProbeGIBaseColor(const FPrimitiveSceneProxyDesc& InProxyDesc);
+ #endif
+ 
+ static TAutoConsoleVariable<int32> CVarForceSingleSampleShadowingFromStationary(
+@@ -647,6 +650,44 @@ PRAGMA_ENABLE_DEPRECATION_WARNINGS
+ 		bOwnerNoSee = true;
+ 		bCastHiddenShadow = false;
+ 	}
++
++	ProbeGIBaseColor = ComputeProbeGIBaseColor(InProxyDesc);
++}
++
++static FColor ComputeProbeGIBaseColor(const FPrimitiveSceneProxyDesc& InProxyDesc)
++{
++	TRACE_CPUPROFILER_EVENT_SCOPE(PrimitiveSceneProxy::GetProbeGIBaseColor);
++
++	static IConsoleVariable* CVarMobileProbeGI = nullptr;
++	if (!CVarMobileProbeGI)
++	{
++		CVarMobileProbeGI = IConsoleManager::Get().FindConsoleVariable(TEXT("r.Mobile.ProbeGI"));
++	}
++	if (!CVarMobileProbeGI || CVarMobileProbeGI->GetInt() == 0 || !InProxyDesc.bAffectDistanceFieldLighting)
++	{
++		return FColor(0, 0, 0, 0);
++	}
++
++	TArray<UMaterialInterface*> Materials;
++	InProxyDesc.GetUsedMaterials(Materials);
++	FLinearColor Sum = FLinearColor::Transparent;
++	int32 NumKnown = 0;
++	for (UMaterialInterface* Material : Materials)
++	{
++		const FLinearColor BaseColor = Material ? Material->GetProbeGIBaseColor() : FLinearColor::Transparent;
++		if (BaseColor.A > 0.0f)
++		{
++			Sum += BaseColor;
++			++NumKnown;
++		}
++	}
++	if (NumKnown == 0)
++	{
++		return FColor(0, 0, 0, 0);
++	}
++	FColor Encoded = (Sum / float(NumKnown)).ToFColorSRGB();
++	Encoded.A = 255;
++	return Encoded;
+ }
+ 
+ void FPrimitiveSceneProxy::OnLevelAddedToWorld_RenderThread()
+diff --git a/Engine/Source/Runtime/Engine/Public/Materials/MaterialInterface.h b/Engine/Source/Runtime/Engine/Public/Materials/MaterialInterface.h
+index 028bd9d96d5d..93ab41d08bc8 100644
+--- a/Engine/Source/Runtime/Engine/Public/Materials/MaterialInterface.h
++++ b/Engine/Source/Runtime/Engine/Public/Materials/MaterialInterface.h
+@@ -404,11 +404,26 @@ public:
+ 	/** A fence to track when the primitive is no longer used as a parent */
+ 	FRenderCommandFence ParentRefFence;
+ 
++	/**
++	 * Average base colour probe GI gives ray hits on this material, alpha 0 when unknown. In the editor it is derived on the game
++	 * thread from the base colour input's constants, parameters and texture averages; cooked builds use the value saved with the asset.
++	 */
++	ENGINE_API FLinearColor GetProbeGIBaseColor();
++
+ protected:
+ 	/** The Lightmass settings for this object. */
+ 	UPROPERTY(EditAnywhere, Category=Lightmass)
+ 	struct FLightmassMaterialInterfaceSettings LightmassSettings;
+ 
++	/** Saved result of GetProbeGIBaseColor. */
++	UPROPERTY()
++	FLinearColor ProbeGIBaseColor = FLinearColor::Transparent;
++
++#if WITH_EDITORONLY_DATA
++	/** Whether ProbeGIBaseColor matches the material graph and parameters as they are now. */
++	bool bProbeGIBaseColorValid = false;
++#endif
++
+ #if WITH_EDITORONLY_DATA
+ 	/** Because of redirector, the texture names need to be resorted at each load in case they changed. */
+ 	UPROPERTY(transient)
+diff --git a/Engine/Source/Runtime/Engine/Public/PrimitiveSceneProxy.h b/Engine/Source/Runtime/Engine/Public/PrimitiveSceneProxy.h
+index 121711df45a8..2d8a7bf3506c 100644
+--- a/Engine/Source/Runtime/Engine/Public/PrimitiveSceneProxy.h
++++ b/Engine/Source/Runtime/Engine/Public/PrimitiveSceneProxy.h
+@@ -817,6 +817,8 @@ PRAGMA_ENABLE_DEPRECATION_WARNINGS
+ 	inline bool WritesVirtualTexture() const{ return bSupportsRuntimeVirtualTexture && RuntimeVirtualTextures.Num() > 0; }
+ 	inline bool AffectsDynamicIndirectLighting() const { return bAffectDynamicIndirectLighting; }
+ 	inline bool AffectsDistanceFieldLighting() const { return bAffectDistanceFieldLighting; }
++	/** Mean base colour of the primitive's materials, sRGB encoded, for probe GI ray hits. Alpha is 0 when unknown. */
++	inline FColor GetProbeGIBaseColor() const { return ProbeGIBaseColor; }
+ 	inline bool AffectsIndirectLightingWhileHidden() const { return bAffectIndirectLightingWhileHidden; }
+ 	inline EIndirectLightingCacheQuality GetIndirectLightingCacheQuality() const { return IndirectLightingCacheQuality; }
+ 	inline bool CastsVolumetricTranslucentShadow() const { return bCastVolumetricTranslucentShadow; }
+@@ -1330,6 +1332,9 @@ private:
+ 	/** Custom primitive data */
+ 	FCustomPrimitiveData CustomPrimitiveData;
+ 
++	/** Filled from the materials only while r.Mobile.ProbeGI is on. */
++	FColor ProbeGIBaseColor = FColor(0, 0, 0, 0);
++
+ 	/** The translucency sort priority */
+ 	int16 TranslucencySortPriority;
+ 
+diff --git a/Engine/Source/Runtime/Renderer/Private/GlobalDistanceField.cpp b/Engine/Source/Runtime/Renderer/Private/GlobalDistanceField.cpp
+index 1d00078942dc..3141919815b6 100644
+--- a/Engine/Source/Runtime/Renderer/Private/GlobalDistanceField.cpp
++++ b/Engine/Source/Runtime/Renderer/Private/GlobalDistanceField.cpp
+@@ -25,6 +25,7 @@
+ #include "HeightfieldLighting.h"
+ #include "Logging/LogMacros.h"
+ #include "Lumen/Lumen.h"
++#include "MobileProbeGI.h"
+ #include "Math/Color.h"
+ #include "Math/DoubleFloat.h"
+ #include "Misc/LargeWorldCoordinates.h"
+@@ -905,7 +906,7 @@ static void ComputeUpdateRegionsAndUpdateViewState(
+ 				GlobalDistanceFieldData.PageFreeListBuffer = AllocatePooledBuffer(FRDGBufferDesc::CreateStructuredDesc(sizeof(uint32), MaxPageNum), TEXT("GlobalDistanceField.PageFreeList"));
+ 			}
+ 
+-			if (bLumenEnabled && Lumen::UseGlobalSDFObjectGrid(*View.Family))
++			if ((bLumenEnabled && Lumen::UseGlobalSDFObjectGrid(*View.Family)) || UseMobileProbeGISurfaceColors(View.GetShaderPlatform()))
+ 			{
+ 				if (!GlobalDistanceFieldData.PageObjectGridBuffer
+ 					|| GlobalDistanceFieldData.PageObjectGridBuffer->Desc.NumElements != PageObjectGridBufferSize)
+diff --git a/Engine/Source/Runtime/Renderer/Private/MobileProbeGI.cpp b/Engine/Source/Runtime/Renderer/Private/MobileProbeGI.cpp
+index 77ca7ca2d5ad..4ab1e81cc381 100644
+--- a/Engine/Source/Runtime/Renderer/Private/MobileProbeGI.cpp
++++ b/Engine/Source/Runtime/Renderer/Private/MobileProbeGI.cpp
+@@ -74,6 +74,13 @@ static TAutoConsoleVariable<float> CVarMobileProbeGIAlbedo(
+ 	TEXT("Diffuse colour assumed for ray hits off screen, where last frame's lit colour is not available."),
+ 	ECVF_Scalability | ECVF_RenderThreadSafe);
+ 
++static TAutoConsoleVariable<int32> CVarMobileProbeGISurfaceColors(
++	TEXT("r.Mobile.ProbeGI.SurfaceColors"),
++	1,
++	TEXT("Ray hits off screen take the average base colour of the mesh they hit, found through the global distance field object grid, instead of r.Mobile.ProbeGI.Albedo. Needs r.Mobile.SupportGPUScene.\n")
++	TEXT("Read only."),
++	ECVF_ReadOnly | ECVF_RenderThreadSafe);
++
+ static TAutoConsoleVariable<float> CVarMobileProbeGIMaxTraceDistance(
+ 	TEXT("r.Mobile.ProbeGI.MaxTraceDistance"),
+ 	10000.0f,
+@@ -164,6 +171,10 @@ public:
+ 
+ 	/** One volume per view state, so editor viewports and split screen keep their own probes. */
+ 	TMap<uint32, FVolume> Volumes;
++
++	/** sRGB base colour per GPU Scene instance, alpha 0 where unknown, as last uploaded. */
++	TArray<uint32> InstanceBaseColors;
++	TRefCountPtr<FRDGPooledBuffer> InstanceBaseColorBuffer;
+ };
+ 
+ IMPLEMENT_SCENE_EXTENSION(FMobileProbeGISceneExtension);
+@@ -226,6 +237,10 @@ class FMobileProbeGITraceCS : public FMobileProbeGIShader
+ 		SHADER_PARAMETER(float, PrevPreExposureInv)
+ 		SHADER_PARAMETER(uint32, bScreenRadiance)
+ 		SHADER_PARAMETER(float, MaxRayLuminance)
++		SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<uint4>, GlobalDistanceFieldPageObjectGridBuffer)
++		SHADER_PARAMETER(uint32, GlobalDistanceFieldPageObjectGridBufferSize)
++		SHADER_PARAMETER_RDG_BUFFER_SRV(Buffer<uint>, InstanceBaseColors)
++		SHADER_PARAMETER(uint32, NumInstanceBaseColors)
+ 	END_SHADER_PARAMETER_STRUCT()
+ 
+ 	static void ModifyCompilationEnvironment(const FGlobalShaderPermutationParameters& Parameters, FShaderCompilerEnvironment& OutEnvironment)
+@@ -298,6 +313,11 @@ bool IsMobileProbeGIEnabled(EShaderPlatform Platform)
+ 		&& CVarMobileProbeGI.GetValueOnAnyThread() != 0;
+ }
+ 
++bool UseMobileProbeGISurfaceColors(EShaderPlatform Platform)
++{
++	return IsMobileProbeGIEnabled(Platform) && UseGPUScene(Platform) && CVarMobileProbeGISurfaceColors.GetValueOnAnyThread() != 0;
++}
++
+ void SetMobileProbeGIBasePassDefines(EShaderPlatform Platform, bool bTranslucentMaterial, FShaderCompilerEnvironment& OutEnvironment)
+ {
+ 	OutEnvironment.SetDefine(TEXT("MOBILE_PROBE_GI"), !bTranslucentMaterial && IsMobileProbeGIEnabled(Platform) ? 1u : 0u);
+@@ -393,6 +413,52 @@ static uint32 GatherProbeLocalLights(FRDGBuilder& GraphBuilder, const FScene& Sc
+ 	return Candidates.Num();
+ }
+ 
++/**
++ * The base colour of every GPU Scene instance the global distance field object grid can name, which is every instance with a mesh
++ * distance field. Uploaded again only when a colour or the instance count changes. Returns how many entries the buffer holds.
++ */
++static uint32 UpdateInstanceBaseColors(FRDGBuilder& GraphBuilder, const FScene& Scene, FMobileProbeGISceneExtension& Extension, FRDGBufferSRVRef& OutColors)
++{
++	TRACE_CPUPROFILER_EVENT_SCOPE(MobileProbeGI::UpdateInstanceBaseColors);
++
++	const int32 NumInstances = Scene.GPUScene.GetNumInstances();
++	TArray<uint32, SceneRenderingAllocator> Colors;
++	Colors.SetNumZeroed(FMath::Max(NumInstances, 1));
++	for (const FPrimitiveAndInstance& Mapping : Scene.DistanceFieldSceneData.PrimitiveInstanceMapping)
++	{
++		const FPrimitiveSceneInfo* Primitive = Mapping.Primitive;
++		const int32 FirstInstance = Primitive ? Primitive->GetInstanceSceneDataOffset() : INDEX_NONE;
++		if (FirstInstance == INDEX_NONE)
++		{
++			continue;
++		}
++		// The same instance ID the distance field object buffer stores for the object grid
++		const int32 Instance = Primitive->Proxy->SupportsInstanceDataBuffer() ? FirstInstance + Mapping.InstanceIndex : FirstInstance;
++		if (Instance < NumInstances)
++		{
++			Colors[Instance] = Primitive->Proxy->GetProbeGIBaseColor().DWColor();
++		}
++	}
++
++	const bool bChanged = !Extension.InstanceBaseColorBuffer
++		|| Extension.InstanceBaseColors.Num() != Colors.Num()
++		|| FMemory::Memcmp(Extension.InstanceBaseColors.GetData(), Colors.GetData(), Colors.Num() * sizeof(uint32)) != 0;
++	FRDGBufferRef Buffer;
++	if (bChanged)
++	{
++		Extension.InstanceBaseColors = Colors;
++		Buffer = GraphBuilder.CreateBuffer(FRDGBufferDesc::CreateBufferDesc(sizeof(uint32), Colors.Num()), TEXT("MobileProbeGI.InstanceBaseColors"));
++		GraphBuilder.QueueBufferUpload(Buffer, Extension.InstanceBaseColors.GetData(), Extension.InstanceBaseColors.Num() * sizeof(uint32), ERDGInitialDataFlags::None);
++		Extension.InstanceBaseColorBuffer = GraphBuilder.ConvertToExternalBuffer(Buffer);
++	}
++	else
++	{
++		Buffer = GraphBuilder.RegisterExternalBuffer(Extension.InstanceBaseColorBuffer);
++	}
++	OutColors = GraphBuilder.CreateSRV(Buffer, PF_R32_UINT);
++	return uint32(Colors.Num());
++}
++
+ /** A random rotation per update, so successive updates cover directions between the previous rays. */
+ static FMatrix44f MakeRayRotation(uint32 FrameIndex)
+ {
+@@ -536,6 +602,20 @@ void RenderMobileProbeGI(FRDGBuilder& GraphBuilder, const FSceneRenderer& SceneR
+ 		PassParameters->SceneDepthTexture = SceneDepth;
+ 		PassParameters->MaxRayLuminance = FMath::Max(CVarMobileProbeGIMaxRayLuminance.GetValueOnRenderThread(), 0.01f);
+ 
++		if (UseMobileProbeGISurfaceColors(View.GetShaderPlatform()) && View.GlobalDistanceFieldInfo.PageObjectGridBuffer)
++		{
++			PassParameters->GlobalDistanceFieldPageObjectGridBuffer = GraphBuilder.CreateSRV(GraphBuilder.RegisterExternalBuffer(View.GlobalDistanceFieldInfo.PageObjectGridBuffer));
++			PassParameters->GlobalDistanceFieldPageObjectGridBufferSize = View.GlobalDistanceFieldInfo.PageObjectGridBuffer->Desc.NumElements;
++			PassParameters->NumInstanceBaseColors = UpdateInstanceBaseColors(GraphBuilder, *Scene, *Extension, PassParameters->InstanceBaseColors);
++		}
++		else
++		{
++			PassParameters->GlobalDistanceFieldPageObjectGridBuffer = GraphBuilder.CreateSRV(GSystemTextures.GetDefaultStructuredBuffer(GraphBuilder, sizeof(FUintVector4)));
++			PassParameters->GlobalDistanceFieldPageObjectGridBufferSize = 0;
++			PassParameters->InstanceBaseColors = GraphBuilder.CreateSRV(GSystemTextures.GetDefaultBuffer(GraphBuilder, sizeof(uint32), 0u), PF_R32_UINT);
++			PassParameters->NumInstanceBaseColors = 0;
++		}
++
+ 		PassParameters->SunDirection = FVector3f::UpVector;
+ 		PassParameters->SunColor = FVector3f::ZeroVector;
+ 		const FBox GridBounds(FVector(GridMin) * Spacing, FVector(GridMin + GridSize) * Spacing);
+diff --git a/Engine/Source/Runtime/Renderer/Private/MobileProbeGI.h b/Engine/Source/Runtime/Renderer/Private/MobileProbeGI.h
+index be0f6e6a5f86..422553a566d7 100644
+--- a/Engine/Source/Runtime/Renderer/Private/MobileProbeGI.h
++++ b/Engine/Source/Runtime/Renderer/Private/MobileProbeGI.h
+@@ -34,6 +34,9 @@ END_GLOBAL_SHADER_PARAMETER_STRUCT()
+ /** Whether r.Mobile.ProbeGI compiles probe sampling into the mobile forward base pass. */
+ bool IsMobileProbeGIEnabled(EShaderPlatform Platform);
+ 
++/** Whether probe GI ray hits look up their surface's colour, through the global distance field object grid and GPU Scene instance IDs. */
++bool UseMobileProbeGISurfaceColors(EShaderPlatform Platform);
++
+ /** Sets the base pass defines that sample the probes, for opaque and masked materials on mobile forward. */
+ void SetMobileProbeGIBasePassDefines(EShaderPlatform Platform, bool bTranslucentMaterial, FShaderCompilerEnvironment& OutEnvironment);
+ 
