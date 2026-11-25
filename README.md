@@ -18,7 +18,9 @@ Clean MSAA and proper ambient occlusion for Unreal Engine 5.8's mobile forward r
 - Coloured bounce light off the buildings around you.
 - Deferred decals that change the surface every light shades, normals and roughness included, correct at every MSAA sample.
 - Soft particles without halos around foreground edges.
-- Screen-space reflections under MSAA without crashing.
+- Screen-space reflections under MSAA without crashing, and reflections of moving objects that stay attached to them.
+- Virtual shadow maps without Nanite or TAA: sharp, detailed sun and local-light shadows at every distance, filtered without temporal noise.
+- Diffuse GI from a grid of probes around the camera: interiors and covered streets stop glowing with sky light, and sun, sky, neon and local lights bounce.
 - Optionally, world normals for post-process materials.
 
 ## Get it working
@@ -43,6 +45,9 @@ You need a UE 5.8 source build, and a project using the mobile renderer (`bPrefe
    git apply <this repo>/Patches/12-height-field-clipmap.patch
    git apply <this repo>/Patches/13-height-field-gi.patch
    git apply <this repo>/Patches/14-clustered-decals.patch
+   git apply <this repo>/Patches/15-ssr-velocity.patch
+   git apply <this repo>/Patches/16-virtual-shadow-maps.patch
+   git apply <this repo>/Patches/17-probe-gi.patch
    ```
 
 2. Build the editor. The first launch recompiles every material.
@@ -76,6 +81,9 @@ Each needs the setup above.
 - **Soft particles without halos:** `r.Mobile.MSAA.PerSampleDepthFade=1`. PC only.
 - **Tonemap subpass on Vulkan devices:** with `r.Mobile.TonemapSubpass=1`, set `r.Mobile.TonemapSubpass.Resolve=2` to tonemap each sample before averaging, so bright edges stop stair-stepping. The PC resolve already does the equivalent.
 - **World normals in post-process materials:** `r.Mobile.Forward.NormalTarget=1`. SceneTexture WorldNormal then works in post-process materials.
+- **Reflections that follow moving objects:** `r.Mobile.ScreenSpaceReflections.Velocity=1`, with screen-space reflections on. Renders velocities without TAA, MSAA included, so a reflected car stays under the car. Not on OpenGL.
+- **Virtual shadow maps:** `r.Mobile.VirtualShadowMaps=1`, `r.Shadow.Virtual.Enable=1` and `r.Mobile.SupportGPUScene=1`. Replaces cascaded and local-light shadow maps for movable lights; no Nanite needed. On Windows it needs DirectX 12 (`DefaultGraphicsRHI_DX12`, or `-d3d12`). Not on OpenGL.
+- **Probe GI:** `r.Mobile.ProbeGI=1`, with `r.GenerateMeshDistanceFields=True`. Probes around the camera trace the global distance field and replace the sky light's diffuse inside their grid. Ray hits on screen take last frame's lit colour, which needs `r.Mobile.ScreenSpaceReflections=1`; hits off screen use the sun, sky and up to 64 nearby point, spot and rect lights.
 
 ## Troubleshoot
 
@@ -96,6 +104,15 @@ Each needs the setup above.
 - **A decal looks frozen.** Decals are baked when they change. For materials animated by time set `r.Mobile.ClusteredDecals.RebakeEveryFrame=1`.
 - **Desktop Vulkan at ES3.1 with MSAA crashes in `vkCmdBeginRenderingKHR` (seen on NVIDIA).** Stock 5.8, with every patch setting at its default too. Set `r.Vulkan.AllowDynamicRendering=0` (read only, in the ini or with `-dpcvars`). The stock tonemap subpass on desktop Vulkan also asserts on a missing `FMobileMultiViewVertexShaderVS`; patch 9 only matters on devices with an on-chip MSAA resolve (Adreno).
 - **Unlit or translucent materials do not get the edge fixes or AO.** Only opaque and masked lit materials do.
+- **Velocity, virtual shadow map and probe GI settings ignored.** `r.Mobile.ScreenSpaceReflections.Velocity`, `r.Mobile.VirtualShadowMaps`, `r.Mobile.VirtualShadowMaps.FilterTaps` and `r.Mobile.ProbeGI` are read only: set them in the ini and restart. They recompile materials.
+- **Fatal error "r.Mobile.VirtualShadowMaps compiles shadow shaders with DXC, which DirectX 11 cannot run".** Switch the project to DirectX 12, or turn `r.Mobile.VirtualShadowMaps` off.
+- **No virtual shadows.** `ProfileGPU` shows `VirtualShadowMapMarkPages` when they run. Check `r.Shadow.Virtual.Enable=1`, `r.Mobile.SupportGPUScene=1`, and that the light is Movable.
+- **Surfaces shadow themselves in stripes.** Raise `r.Mobile.VirtualShadowMaps.NormalBias`.
+- **First launch with virtual shadow maps takes minutes.** Their shaders compile once for the mobile shader platform, then come from the DDC.
+- **Probe GI does nothing.** `ProfileGPU` shows `MobileProbeGI` when it runs. It needs mesh distance fields; `r.Mobile.ProbeGI.Intensity` above 0.
+- **Interiors went dark with probe GI.** Expected: the sky light no longer leaks through walls and roofs. Light reaches the probes through openings and from lights inside.
+- **Blotches of light on walls with probe GI.** Raise `r.Mobile.ProbeGI.RaysPerProbe` or `r.Mobile.ProbeGI.Hysteresis`, or lower `r.Mobile.ProbeGI.Spacing`.
+- **Light leaks through a thin wall with probe GI.** Walls thinner than a global distance field voxel do not stop probe rays. Thicken the wall or its distance field resolution.
 
 ## Tune it
 
@@ -116,6 +133,20 @@ Each needs the setup above.
 | `r.Mobile.PrimitiveAO.EllipsoidScale` | 1.2 | Ellipsoid size against a static mesh's bounds. Lower it if vehicle interiors go dark. |
 | `r.Mobile.ClusteredDecals.AtlasSize` / `.TileSize` | 2048 / 256 | The atlas holds (AtlasSize / TileSize) squared decals. |
 | `r.Mobile.ClusteredDecals.MaxPerTile` | 8 | Decals one 64 px screen tile applies. |
+| `r.Mobile.ScreenSpaceReflections.Steps` | 0 | Reflection ray march steps. 0 keeps 8, or 12 with velocity. Read only. |
+| `r.Mobile.VirtualShadowMaps.FilterRadius` | 1.5 | Shadow edge softness, in screen pixels at the receiver. 0 is hard. |
+| `r.Mobile.VirtualShadowMaps.FilterTaps` | 5 | Lookups per light per pixel: 1, 5 or 9. Read only. |
+| `r.Mobile.VirtualShadowMaps.NormalBias` | 2 | How far lookups step off the surface, in screen pixels. Raise it if surfaces shadow themselves. |
+| `r.Mobile.ProbeGI.Spacing` | 200 | World distance between probes. About 0.24 ms for the whole update at the defaults. |
+| `r.Mobile.ProbeGI.GridSizeXY` / `.GridSizeZ` | 32 / 16 | Probes across and up. The grid covers this times the spacing, centred on the camera. |
+| `r.Mobile.ProbeGI.RaysPerProbe` | 64 | Rays per probe update, 32 to 256. More is smoother and costs more. |
+| `r.Mobile.ProbeGI.UpdateInterval` | 4 | Each probe updates every this many frames. |
+| `r.Mobile.ProbeGI.Hysteresis` | 0.95 | How much of its last value a probe keeps per update. Lower follows moving lights faster. |
+| `r.Mobile.ProbeGI.Intensity` | 1 | Scale on the probe light. 0 restores the sky light. |
+| `r.Mobile.ProbeGI.Albedo` | 0.3 | Colour assumed for off-screen ray hits. |
+| `r.Mobile.ProbeGI.MaxTraceDistance` | 10000 | How far a probe ray goes before it counts as sky. |
+| `r.Mobile.ProbeGI.ScreenRadiance` | 1 | Whether on-screen hits take last frame's lit colour. |
+| `r.Mobile.ProbeGI.LocalLights` / `.LocalLightShadows` | 64 / 1 | Local lights that light off-screen hits, and whether they are shadowed through the distance field. |
 
 On materials, no patch needed: tick **Normal Curvature To Roughness** to stop specular shimmer MSAA cannot fix, and **Use Alpha To Coverage** on masked foliage and fences so their cut-out edges get MSAA too.
 

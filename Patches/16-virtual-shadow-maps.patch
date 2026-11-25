@@ -1,0 +1,1062 @@
+diff --git a/Engine/Shaders/Private/MobileLightingCommon.ush b/Engine/Shaders/Private/MobileLightingCommon.ush
+index 2a0a7399b1fc..7da4bdbc8e99 100644
+--- a/Engine/Shaders/Private/MobileLightingCommon.ush
++++ b/Engine/Shaders/Private/MobileLightingCommon.ush
+@@ -32,6 +32,9 @@
+ 
+ #if MOBILE_USE_SSR
+ #include "MobileSSR.ush"
++#if MOBILE_VIRTUAL_SHADOW_MAP
++#include "MobileVirtualShadowMaps.ush"
++#endif
+ #endif
+ 
+ #ifndef TRANSLUCENCY_NON_DIRECTIONAL
+@@ -348,6 +351,14 @@ void AccumulateDirectionalLighting(FGBufferData GBuffer, float3 TranslatedWorldP
+ 	#endif
+ #endif
+ 
++#if MOBILE_VIRTUAL_SHADOW_MAP
++	BRANCH
++	if (ForwardLightStruct.DirectionalLightVSM != INDEX_NONE)
++	{
++		DynamicShadowing *= MobileVirtualShadowMapFilter(true, ForwardLightStruct.DirectionalLightVSM, TranslatedWorldPosition, GBuffer.WorldNormal, LightData.Direction, ScreenPosition.w);
++	}
++#endif
++
+ 	half4 LightAttenuation = half4(1, 1, DynamicShadowing, DynamicShadowing);
+ 
+ #if TRANSLUCENCY_SH_LIGHTING
+@@ -695,6 +706,15 @@ void AccumulateLightGridLocalLighting(const FCulledLightsGridHeader InLightGridH
+ 
+ 		FDeferredLightData LightData = ConvertToDeferredLight(LocalLight);
+ 
++#if MOBILE_VIRTUAL_SHADOW_MAP
++		BRANCH
++		if (LocalLight.Internal.VirtualShadowMapId != INDEX_NONE)
++		{
++			const float3 ToLight = normalize(LightData.TranslatedWorldPosition - TranslatedWorldPosition);
++			DynamicShadowing = MobileVirtualShadowMapFilter(false, LocalLight.Internal.VirtualShadowMapId, TranslatedWorldPosition, GBuffer.WorldNormal, ToLight, GBuffer.Depth);
++		}
++#endif
++
+ 		if (LightType == LIGHT_TYPE_SPOT || LightType == LIGHT_TYPE_POINT)
+ 		{
+ 			half Attenuation = ComputeLightProfileMultiplier(TranslatedWorldPosition, LightData.TranslatedWorldPosition, -LightData.Direction, LightData.Tangent, LightData.IESAtlasIndex);
+diff --git a/Engine/Shaders/Private/MobileVirtualShadowMaps.ush b/Engine/Shaders/Private/MobileVirtualShadowMaps.ush
+new file mode 100644
+index 000000000000..c0c8692e73db
+--- /dev/null
++++ b/Engine/Shaders/Private/MobileVirtualShadowMaps.ush
+@@ -0,0 +1,57 @@
++// Copyright (c) 2026 Jared Taylor.
++
++#pragma once
++
++#include "VirtualShadowMaps/VirtualShadowMapProjectionCommon.ush"
++
++#ifndef MOBILE_VSM_FILTER_TAPS
++#define MOBILE_VSM_FILTER_TAPS 5
++#endif
++
++/**
++ * Percentage-closer filtering of a virtual shadow map in the forward base pass. Taps sit on a fixed disk in the plane facing the
++ * light, about one screen pixel's footprint apart, so the penumbra is stable from frame to frame and needs no temporal filter.
++ */
++half MobileVirtualShadowMapFilter(bool bDirectional, int VirtualShadowMapId, float3 TranslatedWorldPosition, float3 WorldNormal, float3 ToLight, float SceneDepth)
++{
++	const float3 Up = abs(ToLight.z) < 0.99f ? float3(0, 0, 1) : float3(1, 0, 0);
++	const float3 TangentX = normalize(cross(ToLight, Up));
++	const float3 TangentY = cross(ToLight, TangentX);
++
++	// World size of one screen pixel at this depth, about one shadow texel, since pages are marked at screen resolution
++	const float PixelFootprint = SceneDepth * 2.0f * View.ViewSizeAndInvSize.w / View.ViewToClip[1][1];
++	const float Radius = PixelFootprint * MobileBasePass.VirtualShadowMapFilterRadius;
++
++	// Single lookups have no ray march to step off the receiver, so push the lookup off the surface instead
++	const float3 BiasedPosition = TranslatedWorldPosition + WorldNormal * (PixelFootprint * MobileBasePass.VirtualShadowMapNormalBias);
++	const float RayStartDistance = PixelFootprint * MobileBasePass.VirtualShadowMapNormalBias;
++
++#if MOBILE_VSM_FILTER_TAPS >= 9
++	const float2 Taps[9] = { float2(0, 0), float2(1, 0), float2(-1, 0), float2(0, 1), float2(0, -1), float2(0.707f, 0.707f), float2(-0.707f, 0.707f), float2(0.707f, -0.707f), float2(-0.707f, -0.707f) };
++	const int NumTaps = 9;
++#elif MOBILE_VSM_FILTER_TAPS >= 5
++	const float2 Taps[5] = { float2(0, 0), float2(0.707f, 0.707f), float2(-0.707f, 0.707f), float2(0.707f, -0.707f), float2(-0.707f, -0.707f) };
++	const int NumTaps = 5;
++#else
++	const float2 Taps[1] = { float2(0, 0) };
++	const int NumTaps = 1;
++#endif
++
++	half Lit = 0.0f;
++	UNROLL
++	for (int TapIndex = 0; TapIndex < NumTaps; ++TapIndex)
++	{
++		const float3 TapPosition = BiasedPosition + (TangentX * Taps[TapIndex].x + TangentY * Taps[TapIndex].y) * Radius;
++		FVirtualShadowMapSampleResult Result;
++		if (bDirectional)
++		{
++			Result = SampleVirtualShadowMapDirectional(VirtualShadowMapId, TapPosition, RayStartDistance, WorldNormal, true, SceneDepth);
++		}
++		else
++		{
++			Result = SampleVirtualShadowMapLocal(VirtualShadowMapId, TapPosition, RayStartDistance, WorldNormal, true, SceneDepth);
++		}
++		Lit += half(Result.ShadowFactor);
++	}
++	return Lit / half(NumTaps);
++}
+diff --git a/Engine/Shaders/Private/VirtualShadowMaps/VirtualShadowMapPageAccessCommon.ush b/Engine/Shaders/Private/VirtualShadowMaps/VirtualShadowMapPageAccessCommon.ush
+index 358ddc1ab1bf..055f133e5e94 100644
+--- a/Engine/Shaders/Private/VirtualShadowMaps/VirtualShadowMapPageAccessCommon.ush
++++ b/Engine/Shaders/Private/VirtualShadowMaps/VirtualShadowMapPageAccessCommon.ush
+@@ -10,6 +10,12 @@
+ #include "/Engine/Shared/VirtualShadowMapDefinitions.h"
+ #include "VirtualShadowMapHandle.ush"
+ 
++#if !COMPILER_SUPPORTS_WAVE_VOTE
++// Without wave intrinsics each lane votes alone. Every VSM use of these is an early-out or a fast path a lane can take on its own result.
++#define WaveActiveAllTrue(Expr) (Expr)
++#define WaveActiveAnyTrue(Expr) (Expr)
++#endif
++
+ // NOTE: These page flags are combined hierarchically using bitwise *OR*, so plan/negate them appropriately
+ // Marks pages that are allocated
+ #define VSM_FLAG_ALLOCATED						(1U << 0)
+diff --git a/Engine/Shaders/Private/VirtualShadowMaps/VirtualShadowMapPageMarking.usf b/Engine/Shaders/Private/VirtualShadowMaps/VirtualShadowMapPageMarking.usf
+index afbcbbb6228b..29130f16c68b 100644
+--- a/Engine/Shaders/Private/VirtualShadowMaps/VirtualShadowMapPageMarking.usf
++++ b/Engine/Shaders/Private/VirtualShadowMaps/VirtualShadowMapPageMarking.usf
+@@ -363,8 +363,16 @@ void GeneratePageFlagsFromPixels(
+ 	}
+ #else // PERMUTATION_INPUT_TYPE == INPUT_TYPE_GBUFFER
+ 	{
++	#if SHADING_PATH_MOBILE
++		// Mobile forward has no GBuffer: depth alone marks pages, every pixel but the sky counts, and nothing is backface culled
++		DeviceZ = SceneTexturesStruct.SceneDepthTexture.Load(int3(PixelPos, 0)).r;
++		bIsValid = DeviceZ > 0;
++		bBackfaceCull = false;
++	#else
+ 		DeviceZ = LookupDeviceZ(PixelPos);
+-	#if SUBSTRATE_GBUFFER_FORMAT==1
++	#endif
++	#if SHADING_PATH_MOBILE
++	#elif SUBSTRATE_GBUFFER_FORMAT==1
+ 		const FSubstrateTopLayerData TopLayerData = SubstrateUnpackTopLayerData(Substrate.TopLayerTexture.Load(uint3(PixelPos, 0)));
+ 		FSubstrateAddressing SubstrateAddressing = GetSubstratePixelDataByteOffset(PixelPos, uint2(View.BufferSizeAndInvSize.xy), Substrate.MaxBytesPerPixel);
+ 		FSubstratePixelHeader SubstratePixelHeader = UnpackSubstrateHeaderIn(Substrate.MaterialTextureArray, SubstrateAddressing, Substrate.TopLayerTexture);
+diff --git a/Engine/Source/Runtime/Engine/Private/ShaderCompiler/ShaderCompiler.cpp b/Engine/Source/Runtime/Engine/Private/ShaderCompiler/ShaderCompiler.cpp
+index f69596d4ec28..33032fe44b5c 100644
+--- a/Engine/Source/Runtime/Engine/Private/ShaderCompiler/ShaderCompiler.cpp
++++ b/Engine/Source/Runtime/Engine/Private/ShaderCompiler/ShaderCompiler.cpp
+@@ -3847,7 +3847,13 @@ void GlobalBeginCompileShader(
+ 
+ 	// Add compiler flag CFLAG_ForceDXC if DXC is enabled
+ 	const bool bHlslVersion2021 = Input.Environment.CompilerFlags.Contains(CFLAG_HLSL2021);
+-	const bool bIsDxcEnabled = IsDxcEnabledForPlatform((EShaderPlatform)Target.Platform, bHlslVersion2021);
++	// Virtual shadow map page management binds more UAVs than FXC and D3D11 allow, and their shadow depth pixel shaders write pages
++	// through a uniform buffer UAV, so on mobile D3D those shaders need DXC and D3D12
++	const bool bMobileVirtualShadowMapDXC = IsMobileVirtualShadowMapsEnabled((EShaderPlatform)Target.Platform)
++		&& IsD3DPlatform((EShaderPlatform)Target.Platform)
++		&& (Input.VirtualSourceFilePath.StartsWith(TEXT("/Engine/Private/VirtualShadowMaps/"))
++			|| Input.VirtualSourceFilePath.StartsWith(TEXT("/Engine/Private/ShadowDepth")));
++	const bool bIsDxcEnabled = bMobileVirtualShadowMapDXC || IsDxcEnabledForPlatform((EShaderPlatform)Target.Platform, bHlslVersion2021);
+ 	SET_SHADER_DEFINE(Input.Environment, COMPILER_DXC, bIsDxcEnabled);
+ 	if (bIsDxcEnabled)
+ 	{
+diff --git a/Engine/Source/Runtime/RenderCore/Private/RenderUtils.cpp b/Engine/Source/Runtime/RenderCore/Private/RenderUtils.cpp
+index 2285dd4d0b1e..b84f409046a6 100644
+--- a/Engine/Source/Runtime/RenderCore/Private/RenderUtils.cpp
++++ b/Engine/Source/Runtime/RenderCore/Private/RenderUtils.cpp
+@@ -672,7 +672,7 @@ RENDERCORE_API bool MobileUsesFullDepthPrepass(const FStaticShaderPlatform Platf
+ 		if (!IsMobileDeferredShadingEnabled(Platform) || MobileAllowFramebufferFetch(Platform))
+ 		{
+ 			// Features that require full depth before lighting
+-			return MobileUsesShadowMaskTexture(Platform) || IsMobileAmbientOcclusionEnabled(Platform);
++			return MobileUsesShadowMaskTexture(Platform) || IsMobileAmbientOcclusionEnabled(Platform) || IsMobileVirtualShadowMapsEnabled(Platform);
+ 		}
+ 	}
+ 	return bForcedDepthPrepass;
+@@ -744,6 +744,14 @@ static FAutoConsoleVariableRef CVarForwardShading(
+ 	ECVF_RenderThreadSafe | ECVF_ReadOnly
+ 	); 
+ 
++static TAutoConsoleVariable<int32> CVarMobileVirtualShadowMaps(
++	TEXT("r.Mobile.VirtualShadowMaps"),
++	0,
++	TEXT("Gives mobile forward non-Nanite virtual shadow maps, without Nanite or 64-bit atomics. Also needs r.Shadow.Virtual.Enable=1 and r.Mobile.SupportGPUScene=1.\n")
++	TEXT("Read only, recompiles shaders."),
++	ECVF_RenderThreadSafe | ECVF_ReadOnly
++	);
++
+ static TAutoConsoleVariable<int32> CVarGBufferDiffuseSampleOcclusion(
+ 	TEXT("r.GBufferDiffuseSampleOcclusion"), 0,
+ 	TEXT("Whether the gbuffer contain occlusion information for individual diffuse samples."),
+@@ -1501,7 +1509,18 @@ bool DoesPlatformSupportVirtualShadowMaps(EShaderPlatform Platform)
+ 	static FShaderPlatformCachedIniValue<int32> CVarPlatformVSMProjectEnabled(TEXT("r.Shadow.Virtual.ProjectEnabled"));
+ 	bool bIsProjectEnable = CVarPlatformVSMProjectEnabled.Get(Platform) != 0;
+ 
+-	return bIsProjectEnable && DoesPlatformSupportNanite(Platform);
++	return bIsProjectEnable && (DoesPlatformSupportNanite(Platform) || IsMobileVirtualShadowMapsEnabled(Platform));
++}
++
++bool IsMobileVirtualShadowMapsEnabled(const FStaticShaderPlatform Platform)
++{
++	static FShaderPlatformCachedIniValue<bool> MobileVirtualShadowMaps(TEXT("r.Mobile.VirtualShadowMaps"));
++	// OpenGL lacks the pixel shader UAV atomics the shadow depth pass writes pages with
++	return IsMobilePlatform(Platform)
++		&& !IsOpenGLPlatform(Platform)
++		&& !IsMobileDeferredShadingEnabled(Platform)
++		&& MobileSupportsGPUScene()
++		&& MobileVirtualShadowMaps.Get(Platform);
+ }
+ 
+ bool DoesPlatformSupportNonNaniteVirtualShadowMaps(EShaderPlatform ShaderPlatform)
+@@ -1521,6 +1540,10 @@ bool UseVirtualShadowMaps(EShaderPlatform ShaderPlatform)
+ {
+ 	static const auto EnableVirtualSMCVar = IConsoleManager::Get().FindConsoleVariable(TEXT("r.Shadow.Virtual.Enable"));
+ 	const bool bVirtualShadowMapsEnabled = EnableVirtualSMCVar ? (EnableVirtualSMCVar->GetInt() != 0) : false;
++	if (IsMobileVirtualShadowMapsEnabled(ShaderPlatform))
++	{
++		return bVirtualShadowMapsEnabled && DoesPlatformSupportVirtualShadowMaps(ShaderPlatform);
++	}
+ 	return bVirtualShadowMapsEnabled &&
+ 		DoesPlatformSupportVirtualShadowMaps(ShaderPlatform) &&
+ 		DoesRuntimeSupportNanite(ShaderPlatform, true /* check for atomics */, true /* check project setting */);
+diff --git a/Engine/Source/Runtime/RenderCore/Private/Shader.cpp b/Engine/Source/Runtime/RenderCore/Private/Shader.cpp
+index e203a258638f..3ea5dcf2ac69 100644
+--- a/Engine/Source/Runtime/RenderCore/Private/Shader.cpp
++++ b/Engine/Source/Runtime/RenderCore/Private/Shader.cpp
+@@ -2085,6 +2085,11 @@ void ShaderMapAppendKey(EShaderPlatform Platform, FShaderKeyGenerator& KeyGen)
+ 					KeyGen.Append(TEXT("MobSSRV"));
+ 				}
+ 
++				if (IsMobileVirtualShadowMapsEnabled(Platform))
++				{
++					KeyGen.AppendSeparator();
++					KeyGen.Append(TEXT("MobVSMDXC"));
++				}
+ 			}
+ 		}
+ 
+diff --git a/Engine/Source/Runtime/RenderCore/Public/RenderUtils.h b/Engine/Source/Runtime/RenderCore/Public/RenderUtils.h
+index d47c5f99f8c7..19b85843cbeb 100644
+--- a/Engine/Source/Runtime/RenderCore/Public/RenderUtils.h
++++ b/Engine/Source/Runtime/RenderCore/Public/RenderUtils.h
+@@ -477,10 +477,13 @@ RENDERCORE_API bool UseVirtualShadowMaps(EShaderPlatform ShaderPlatform, const F
+ 
+ /**
+ * Returns true if Virtual Shadow Mapsare supported for the given shader platform.
+-* Note: Virtual Shadow Maps require Nanite platform support.
++* Note: Virtual Shadow Maps require Nanite platform support, except on mobile forward with r.Mobile.VirtualShadowMaps.
+ */
+ RENDERCORE_API bool DoesPlatformSupportVirtualShadowMaps(EShaderPlatform Platform);
+ 
++/** Returns if r.Mobile.VirtualShadowMaps gives this mobile forward platform non-Nanite virtual shadow maps, which need no Nanite and no 64-bit atomics. */
++RENDERCORE_API bool IsMobileVirtualShadowMapsEnabled(const FStaticShaderPlatform Platform);
++
+ /**
+ * Returns true if non-Nanite virtual shadow maps are enabled by CVar r.Shadow.Virtual.NonNanite.ProjectEnabled
+ * and the runtime supports Nanite/virtual shadow maps.
+diff --git a/Engine/Source/Runtime/Renderer/Private/MobileBasePassRendering.cpp b/Engine/Source/Runtime/Renderer/Private/MobileBasePassRendering.cpp
+index 12268f681c1b..72b9a459e58f 100644
+--- a/Engine/Source/Runtime/Renderer/Private/MobileBasePassRendering.cpp
++++ b/Engine/Source/Runtime/Renderer/Private/MobileBasePassRendering.cpp
+@@ -8,6 +8,7 @@
+ #include "MobileHeightFieldAORendering.h"
+ #include "MobileClusteredDecals.h"
+ #include "MobileSSR.h"
++#include "MobileVirtualShadowMaps.h"
+ #include "DynamicPrimitiveDrawing.h"
+ #include "ScenePrivate.h"
+ #include "SceneProxies/SkyLightSceneProxy.h"
+@@ -297,6 +298,8 @@ void MobileBasePassModifyCompilationEnvironment(const FMaterialShaderPermutation
+ 	OutEnvironment.SetDefine(TEXT("MOBILE_TRANSLUCENT_MSAA_DEPTH"), bTranslucentMSAADepth ? 1u : 0u);
+ 	OutEnvironment.SetDefine(TEXT("MOBILE_HEIGHTFIELD_GI"), !bDeferredShadingEnabled && IsMobileHeightFieldGIEnabled() ? 1u : 0u);
+ 	OutEnvironment.SetDefine(TEXT("MOBILE_CLUSTERED_DECALS"), !bTranslucentMaterial && IsMobileClusteredDecalsEnabled(Parameters.Platform) ? 1u : 0u);
++
++	SetMobileVirtualShadowMapBasePassDefines(Parameters.Platform, bTranslucentMaterial || bDeferredShadingEnabled, OutEnvironment);
+ 	if (!bDeferredShadingEnabled && AreMobileScreenSpaceReflectionsEnabled(Parameters.Platform))
+ 	{
+ 		// EMobileSSRQuality: Medium samples the velocity texture, Low reprojects by camera motion only
+@@ -407,6 +410,8 @@ void SetupMobileBasePassUniformParameters(
+ 	BasePassParameters.MSAAResolvedDepthTexture = bMSAAEdgeAwareFetch ? SceneTextures->Depth.Resolve : SystemTextures.DepthDummy;
+ 	BasePassParameters.bMSAAEdgeAwareFetch = bMSAAEdgeAwareFetch ? 1 : 0;
+ 	BasePassParameters.MSAAEdgeDepthThreshold = FMath::Max(CVarMobileMSAAEdgeDepthThreshold.GetValueOnRenderThread(), 0.0f);
++	BasePassParameters.VirtualShadowMapFilterRadius = GetMobileVirtualShadowMapFilterRadius();
++	BasePassParameters.VirtualShadowMapNormalBias = GetMobileVirtualShadowMapNormalBias();
+ 
+ 	// Only the multi-pass translucency pass has the MSAA depth readable: it binds depth read-only and it is not memoryless
+ 	const bool bMSAASceneDepth = CVarMobileMSAAPerSampleDepthFade.GetValueOnRenderThread() != 0
+@@ -561,7 +566,8 @@ void SetupMobileDirectionalLightUniformParameters(
+ 				const FProjectedShadowInfo* ShadowInfo = DirectionalLightShadowInfos[i];
+ 
+ 				const FViewInfo* DependentSceneView = IStereoRendering::IsAPrimaryView(SceneView) ? &SceneView : SceneView.GetPrimaryView();
+-				if (ShadowInfo->ShadowDepthView && !ShadowInfo->bRayTracedDistanceField && ShadowInfo->CacheMode != SDCM_StaticPrimitivesOnly && ShadowInfo->DependentView == DependentSceneView)
++				// Virtual shadow maps have no depth target here; the base pass samples their pages instead
++				if (ShadowInfo->ShadowDepthView && !ShadowInfo->bRayTracedDistanceField && !ShadowInfo->HasVirtualShadowMap() && ShadowInfo->CacheMode != SDCM_StaticPrimitivesOnly && ShadowInfo->DependentView == DependentSceneView)
+ 				{
+ 					if (OutShadowIndex == 0)
+ 					{
+diff --git a/Engine/Source/Runtime/Renderer/Private/MobileBasePassRendering.h b/Engine/Source/Runtime/Renderer/Private/MobileBasePassRendering.h
+index 3a951a641231..334549c2b809 100644
+--- a/Engine/Source/Runtime/Renderer/Private/MobileBasePassRendering.h
++++ b/Engine/Source/Runtime/Renderer/Private/MobileBasePassRendering.h
+@@ -76,6 +76,8 @@ BEGIN_GLOBAL_SHADER_PARAMETER_STRUCT(FMobileBasePassUniformParameters, )
+ 	SHADER_PARAMETER(uint32, ClusteredDecalTileShift)
+ 	SHADER_PARAMETER(uint32, ClusteredDecalTileStride)
+ 	SHADER_PARAMETER(uint32, NumClusteredDecals)
++	SHADER_PARAMETER(float, VirtualShadowMapFilterRadius)
++	SHADER_PARAMETER(float, VirtualShadowMapNormalBias)
+ 	SHADER_PARAMETER(uint32, bApplyHalfResLocalFogToSkyMeshes)
+ 	SHADER_PARAMETER_RDG_TEXTURE(Texture2D, HalfResLocalFogVolumeViewTexture)
+ 	SHADER_PARAMETER_SAMPLER(SamplerState, HalfResLocalFogVolumeViewSampler)
+diff --git a/Engine/Source/Runtime/Renderer/Private/MobileShadingRenderer.cpp b/Engine/Source/Runtime/Renderer/Private/MobileShadingRenderer.cpp
+index 73e96ecba194..7d41c383a2aa 100644
+--- a/Engine/Source/Runtime/Renderer/Private/MobileShadingRenderer.cpp
++++ b/Engine/Source/Runtime/Renderer/Private/MobileShadingRenderer.cpp
+@@ -139,6 +139,7 @@
+ #include "VelocityRendering.h"
+ #include "ViewData.h"
+ #include "VirtualShadowMaps/VirtualShadowMapArray.h"
++#include "MobileVirtualShadowMaps.h"
+ #include "VT/VirtualTextureFeedbackResource.h"
+ #include "VT/VirtualTextureSystem.h"
+ #include "WaterInfoTextureRendering.h"
+@@ -313,6 +314,7 @@ BEGIN_SHADER_PARAMETER_STRUCT(FMobileRenderPassParameters,)
+ 	SHADER_PARAMETER_STRUCT_INCLUDE(FInstanceCullingDrawParams, InstanceCullingDrawParams)
+ 	SHADER_PARAMETER_RDG_UNIFORM_BUFFER(FMobileBasePassUniformParameters, MobileBasePass)
+ 	SHADER_PARAMETER_STRUCT_REF(FMobileReflectionCaptureShaderData, ReflectionCapture)
++	SHADER_PARAMETER_RDG_UNIFORM_BUFFER(FVirtualShadowMapUniformParameters, VirtualShadowMap)
+ 	SHADER_PARAMETER_RDG_BUFFER_SRV(Buffer<float4>, LocalFogVolumeInstances)
+ 	RDG_BUFFER_ACCESS(LocalFogVolumeTileDrawIndirectBuffer, ERHIAccess::IndirectArgs)
+ 	SHADER_PARAMETER_RDG_TEXTURE_SRV(Texture2DArray<uint>, LocalFogVolumeTileDataTexture)
+@@ -429,6 +431,8 @@ FMobileSceneRenderer::FMobileSceneRenderer(const FSceneViewFamily* InViewFamily,
+ 	bIsMaskedOnlyDepthPrepassEnabled = Scene->EarlyZPassMode == DDM_MaskedOnly;
+ 	bEnableClusteredLocalLights = MobileForwardEnableLocalLights(ShaderPlatform);
+ 	bEnableClusteredReflections = MobileForwardEnableClusteredReflections(ShaderPlatform);
++
++	CheckMobileVirtualShadowMapsRHI(ShaderPlatform);
+ 		
+ 	StandardTranslucencyPass = ViewFamily.AllowTranslucencyAfterDOF() ? ETranslucencyPass::TPT_TranslucencyStandard : ETranslucencyPass::TPT_AllTranslucency;
+ 	StandardTranslucencyMeshPass = TranslucencyPassToMeshPass(StandardTranslucencyPass);
+@@ -1227,7 +1231,9 @@ void FMobileSceneRenderer::Render(FRDGBuilder& GraphBuilder, const FSceneRenderU
+ 	// If we're rendering with async compute then render shadows after the prepass
+ 	// We don't do this in the general case because it is slower on some platforms
+ 	extern int32 GDFShadowAsyncCompute;
+-	const bool bRenderShadowsAfterPrepass = !!GDFShadowAsyncCompute && bIsFullDepthPrepassEnabled;
++	// Virtual shadow map pages are marked from the prepass depth, so their shadows must render after it
++	const bool bMobileVirtualShadowMaps = UseVirtualShadowMaps(ShaderPlatform, FeatureLevel) && IsMobileVirtualShadowMapsEnabled(ShaderPlatform);
++	const bool bRenderShadowsAfterPrepass = (!!GDFShadowAsyncCompute || bMobileVirtualShadowMaps) && bIsFullDepthPrepassEnabled;
+ 
+ 	if (SceneUpdateInputs)
+ 	{
+@@ -1745,6 +1751,8 @@ void FMobileSceneRenderer::Render(FRDGBuilder& GraphBuilder, const FSceneRenderU
+ 			// Note: this is a no-op if async DF shadows is disabled
+ 			BeginAsyncDistanceFieldShadowProjections(GraphBuilder, SceneTextures, InitViewTaskDatas.DynamicShadows);
+ 
++			BeginMarkMobileVirtualShadowMapPages(GraphBuilder, SceneTextures);
++
+ 			// Render shadows after the prepass so we can overap async compute work with shadows
+ 			RenderShadowDepthMaps(GraphBuilder, nullptr, InstanceCullingManager, ExternalAccessQueue);
+ 			GraphBuilder.AddDispatchHint();
+@@ -1965,6 +1973,11 @@ void FMobileSceneRenderer::Render(FRDGBuilder& GraphBuilder, const FSceneRenderU
+ 	GEngine->GetPostRenderDelegateEx().Broadcast(GraphBuilder);
+ 	GetSceneExtensionsRenderers().PostRender(GraphBuilder);
+ 
++	if (bRendererOutputFinalSceneColor)
++	{
++		ExtractMobileVirtualShadowMapFrameData(GraphBuilder);
++	}
++
+ 	FinishUpdateExposureCompensationCurveLUT(GraphBuilder.RHICmdList, &UpdateExposureCompensationCurveLUTTaskData);
+ 
+ 	if (bUseVirtualTexturing)
+@@ -2215,6 +2228,7 @@ void FMobileSceneRenderer::RenderForward(FRDGBuilder& GraphBuilder, FRDGTextureR
+ 		PassParameters->View = View.GetShaderParameters();
+ 		PassParameters->MobileBasePass = CreateMobileBasePassUniformBuffer(GraphBuilder, View, EMobileBasePass::Opaque, SetupMode, BasePassTextures);
+ 		PassParameters->ReflectionCapture = View.MobileReflectionCaptureUniformBuffer;
++		PassParameters->VirtualShadowMap = GetMobileVirtualShadowMapUniformBuffer(GraphBuilder, VirtualShadowMapArray, ShaderPlatform, ViewContext.ViewIndex);
+ 		PassParameters->RenderTargets = BasePassRenderTargets;
+ 		PassParameters->LocalFogVolumeInstances = View.LocalFogVolumeViewData.GPUInstanceDataBufferSRV;
+ 		PassParameters->LocalFogVolumeTileDrawIndirectBuffer = View.LocalFogVolumeViewData.GPUTileDrawIndirectBuffer;
+diff --git a/Engine/Source/Runtime/Renderer/Private/MobileVirtualShadowMaps.cpp b/Engine/Source/Runtime/Renderer/Private/MobileVirtualShadowMaps.cpp
+new file mode 100644
+index 000000000000..70da5da0a465
+--- /dev/null
++++ b/Engine/Source/Runtime/Renderer/Private/MobileVirtualShadowMaps.cpp
+@@ -0,0 +1,108 @@
++// Copyright (c) 2026 Jared Taylor.
++
++#include "MobileVirtualShadowMaps.h"
++
++#include "DynamicRHI.h"
++#include "FrontLayerTranslucency.h"
++#include "LogRenderer.h"
++#include "Froxel/Froxel.h"
++#include "ProfilingDebugging/CpuProfilerTrace.h"
++#include "RenderGraphBuilder.h"
++#include "RenderUtils.h"
++#include "SceneRendering.h"
++#include "SceneTextures.h"
++#include "ScenePrivate.h"
++#include "Shadows/ShadowSceneRenderer.h"
++#include "VirtualShadowMaps/VirtualShadowMapArray.h"
++#include "VirtualShadowMaps/VirtualShadowMapCacheManager.h"
++
++static TAutoConsoleVariable<float> CVarMobileVirtualShadowMapsFilterRadius(
++	TEXT("r.Mobile.VirtualShadowMaps.FilterRadius"),
++	1.5f,
++	TEXT("Radius of the mobile forward virtual shadow map filter, in screen pixels at the receiver. 0 gives hard edges."),
++	ECVF_Scalability | ECVF_RenderThreadSafe);
++
++static TAutoConsoleVariable<int32> CVarMobileVirtualShadowMapsFilterTaps(
++	TEXT("r.Mobile.VirtualShadowMaps.FilterTaps"),
++	5,
++	TEXT("Shadow map lookups per light per pixel for the mobile forward virtual shadow map filter: 1, 5 or 9.\n")
++	TEXT("Read only, recompiles materials."),
++	ECVF_ReadOnly | ECVF_RenderThreadSafe);
++
++static TAutoConsoleVariable<float> CVarMobileVirtualShadowMapsNormalBias(
++	TEXT("r.Mobile.VirtualShadowMaps.NormalBias"),
++	2.0f,
++	TEXT("How far each shadow lookup steps off the receiver, along its normal and towards the light, in screen pixels at the receiver. Raise it if surfaces shadow themselves in stripes."),
++	ECVF_Scalability | ECVF_RenderThreadSafe);
++
++float GetMobileVirtualShadowMapNormalBias()
++{
++	return FMath::Max(CVarMobileVirtualShadowMapsNormalBias.GetValueOnRenderThread(), 0.0f);
++}
++
++float GetMobileVirtualShadowMapFilterRadius()
++{
++	return FMath::Max(CVarMobileVirtualShadowMapsFilterRadius.GetValueOnRenderThread(), 0.0f);
++}
++
++void CheckMobileVirtualShadowMapsRHI(EShaderPlatform Platform)
++{
++	if (IsMobileVirtualShadowMapsEnabled(Platform) && IsD3DPlatform(Platform) && RHIGetInterfaceType() == ERHIInterfaceType::D3D11)
++	{
++		UE_LOG(LogRenderer, Fatal, TEXT("r.Mobile.VirtualShadowMaps compiles shadow shaders with DXC, which DirectX 11 cannot run. Use DirectX 12 (-d3d12, or DefaultGraphicsRHI_DX12), or turn r.Mobile.VirtualShadowMaps off."));
++	}
++}
++
++void SetMobileVirtualShadowMapBasePassDefines(EShaderPlatform Platform, bool bTranslucentMaterial, FShaderCompilerEnvironment& OutEnvironment)
++{
++	// Pages are marked from the opaque depth prepass, so translucency would only find unmarked pages
++	const bool bEnabled = !bTranslucentMaterial && IsMobileVirtualShadowMapsEnabled(Platform);
++	OutEnvironment.SetDefine(TEXT("MOBILE_VIRTUAL_SHADOW_MAP"), bEnabled ? 1u : 0u);
++	if (bEnabled)
++	{
++		OutEnvironment.SetDefine(TEXT("MOBILE_VSM_FILTER_TAPS"), FMath::Clamp(CVarMobileVirtualShadowMapsFilterTaps.GetValueOnAnyThread(), 1, 9));
++		FVirtualShadowMapArray::SetShaderDefines(OutEnvironment);
++	}
++}
++
++TRDGUniformBufferRef<FVirtualShadowMapUniformParameters> GetMobileVirtualShadowMapUniformBuffer(FRDGBuilder& GraphBuilder, const FVirtualShadowMapArray& VirtualShadowMapArray, EShaderPlatform Platform, int32 ViewIndex)
++{
++	if (!IsMobileVirtualShadowMapsEnabled(Platform))
++	{
++		return nullptr;
++	}
++
++	// Initialize fills the cached buffers over dummy data, which the shadow depths pass replaces once pages exist
++	return VirtualShadowMapArray.GetUniformBuffer(ViewIndex);
++}
++
++void FMobileSceneRenderer::BeginMarkMobileVirtualShadowMapPages(FRDGBuilder& GraphBuilder, FSceneTextures& SceneTextures)
++{
++	TRACE_CPUPROFILER_EVENT_SCOPE(MobileSceneRenderer::BeginMarkMobileVirtualShadowMapPages);
++
++	FShadowSceneRenderer* ShadowSceneRenderer = GetSceneExtensionsRenderers().GetRendererPtr<FShadowSceneRenderer>();
++	if (!ShadowSceneRenderer || !VirtualShadowMapArray.IsEnabled() || !HasBeenProduced(SceneTextures.Depth.Resolve))
++	{
++		return;
++	}
++
++	// Page marking reads depth through the deferred scene texture uniform buffer, which mobile does not otherwise create
++	FSceneTextureUniformParameters* SceneTextureParameters = GraphBuilder.AllocParameters<FSceneTextureUniformParameters>();
++	SetupSceneTextureUniformParameters(GraphBuilder, &SceneTextures, FeatureLevel, ESceneTextureSetupMode::SceneDepth, *SceneTextureParameters);
++	// Mobile has no partial depth
++	SceneTextureParameters->ScenePartialDepthTexture = SceneTextureParameters->SceneDepthTexture;
++	SceneTextures.UniformBuffer = GraphBuilder.CreateUniformBuffer(SceneTextureParameters);
++
++	ShadowSceneRenderer->BeginMarkVirtualShadowMapPages(GraphBuilder, nullptr, FFrontLayerTranslucencyData(), Froxel::FRenderer());
++}
++
++void FMobileSceneRenderer::ExtractMobileVirtualShadowMapFrameData(FRDGBuilder& GraphBuilder)
++{
++	TRACE_CPUPROFILER_EVENT_SCOPE(MobileSceneRenderer::ExtractMobileVirtualShadowMapFrameData);
++
++	// Runs even with virtual shadow maps off this frame, to drop data a previous frame extracted
++	if (FVirtualShadowMapArrayCacheManager* CacheManager = VirtualShadowMapArray.CacheManager)
++	{
++		CacheManager->ExtractFrameData(GraphBuilder, VirtualShadowMapArray, *this, ViewFamily.EngineShowFlags.VirtualShadowMapPersistentData);
++	}
++}
+diff --git a/Engine/Source/Runtime/Renderer/Private/MobileVirtualShadowMaps.h b/Engine/Source/Runtime/Renderer/Private/MobileVirtualShadowMaps.h
+new file mode 100644
+index 000000000000..b2d18dff75dc
+--- /dev/null
++++ b/Engine/Source/Runtime/Renderer/Private/MobileVirtualShadowMaps.h
+@@ -0,0 +1,26 @@
++// Copyright (c) 2026 Jared Taylor.
++
++#pragma once
++
++#include "CoreMinimal.h"
++#include "RenderGraphFwd.h"
++#include "RHIShaderPlatform.h"
++
++class FVirtualShadowMapArray;
++class FVirtualShadowMapUniformParameters;
++struct FShaderCompilerEnvironment;
++
++/** r.Mobile.VirtualShadowMaps.FilterRadius: the PCF radius in screen pixels at the receiver. */
++float GetMobileVirtualShadowMapFilterRadius();
++
++/** r.Mobile.VirtualShadowMaps.NormalBias: how far lookups step off the receiver, in screen pixels at the receiver. */
++float GetMobileVirtualShadowMapNormalBias();
++
++/** Stops with an explanation when r.Mobile.VirtualShadowMaps runs on D3D11, which cannot load the DXC-compiled shaders it needs. */
++void CheckMobileVirtualShadowMapsRHI(EShaderPlatform Platform);
++
++/** Sets the base pass defines that sample virtual shadow maps, for opaque and masked materials on mobile forward. */
++void SetMobileVirtualShadowMapBasePassDefines(EShaderPlatform Platform, bool bTranslucentMaterial, FShaderCompilerEnvironment& OutEnvironment);
++
++/** The view's virtual shadow map uniform buffer for the forward base pass, over dummy data on frames without virtual shadow maps. Null where the platform has none. */
++TRDGUniformBufferRef<FVirtualShadowMapUniformParameters> GetMobileVirtualShadowMapUniformBuffer(FRDGBuilder& GraphBuilder, const FVirtualShadowMapArray& VirtualShadowMapArray, EShaderPlatform Platform, int32 ViewIndex);
+diff --git a/Engine/Source/Runtime/Renderer/Private/SceneRendering.h b/Engine/Source/Runtime/Renderer/Private/SceneRendering.h
+index f1032e2377e2..5e281ef64b59 100644
+--- a/Engine/Source/Runtime/Renderer/Private/SceneRendering.h
++++ b/Engine/Source/Runtime/Renderer/Private/SceneRendering.h
+@@ -2203,6 +2203,9 @@ public:
+ 	 */
+ 	virtual FDeferredShadingSceneRenderer* GetDeferredShadingSceneRenderer() { return nullptr; }
+ 
++	/** The mobile renderer, for scene extensions that also run on mobile, such as virtual shadow maps (r.Mobile.VirtualShadowMaps). */
++	virtual class FMobileSceneRenderer* GetMobileSceneRenderer() { return nullptr; }
++
+ 	/**
+ 	* Utility function to retrieve from a View the appropriate ViewRect used to create an HZB
+ 	*/
+@@ -2979,6 +2982,8 @@ public:
+ 
+ 	virtual bool AllowSimpleLights() const override;
+ 
++	virtual FMobileSceneRenderer* GetMobileSceneRenderer() override { return this; }
++
+ 	/** Whether platform requires multiple render-passes for SceneColor rendering */
+ 	static bool RequiresMultiPass(int32 NumMSAASamples, EShaderPlatform ShaderPlatform);
+ 
+@@ -3018,6 +3023,11 @@ protected:
+ 	/** Renders opaque velocities against MSAA scene depth into a target of the same sample count, then resolves them into SceneTextures.Velocity. */
+ 	void RenderMSAAVelocities(FRDGBuilder& GraphBuilder, FSceneTextures& SceneTextures);
+ 
++	/** Marks the virtual shadow map pages the resolved prepass depth needs, before RenderShadowDepthMaps allocates and renders them (r.Mobile.VirtualShadowMaps). */
++	void BeginMarkMobileVirtualShadowMapPages(FRDGBuilder& GraphBuilder, FSceneTextures& SceneTextures);
++
++	/** Hands this frame's virtual shadow map pages to the cache for the next frame. */
++	void ExtractMobileVirtualShadowMapFrameData(FRDGBuilder& GraphBuilder);
+ 
+ 	void RenderVelocityPass(FRHICommandList& RHICmdList, const FViewInfo& View, const FInstanceCullingDrawParams* InstanceCullingDrawParams);
+ 
+diff --git a/Engine/Source/Runtime/Renderer/Private/SceneTextureReductions.cpp b/Engine/Source/Runtime/Renderer/Private/SceneTextureReductions.cpp
+index 89dacd4f6f99..8a49aa38f659 100644
+--- a/Engine/Source/Runtime/Renderer/Private/SceneTextureReductions.cpp
++++ b/Engine/Source/Runtime/Renderer/Private/SceneTextureReductions.cpp
+@@ -85,8 +85,8 @@ class FHZBBuildCS : public FGlobalShader
+ 	{
+ 		FPermutationDomain PermutationVector(Parameters.PermutationId);
+ 		
+-		// No need for froxels on non-VSM platforms
+-		if (PermutationVector.Get<FDimFroxels>() && !DoesPlatformSupportVirtualShadowMaps(Parameters.Platform))
++		// No need for froxels on non-VSM platforms, nor on mobile, which marks virtual shadow map pages from depth alone
++		if (PermutationVector.Get<FDimFroxels>() && (!DoesPlatformSupportVirtualShadowMaps(Parameters.Platform) || IsMobilePlatform(Parameters.Platform)))
+ 		{
+ 			return false;
+ 		}
+diff --git a/Engine/Source/Runtime/Renderer/Private/ShadowDepthRendering.cpp b/Engine/Source/Runtime/Renderer/Private/ShadowDepthRendering.cpp
+index c56e99265b48..28e2bde6d02d 100644
+--- a/Engine/Source/Runtime/Renderer/Private/ShadowDepthRendering.cpp
++++ b/Engine/Source/Runtime/Renderer/Private/ShadowDepthRendering.cpp
+@@ -270,6 +270,19 @@ void SetupShadowDepthPassUniformBuffer(
+ 			ShadowDepthPassParameters.ShadowViewProjectionMatrices[FaceIndex] = FMatrix44f(Translation * ShadowInfo->OnePassShadowViewProjectionMatrices[FaceIndex]);		// LWC_TODO: Precision loss?
+ 		}
+ 	}
++
++	SetupMobileShadowDepthPassVirtualShadowMapDummies(GraphBuilder, ShadowDepthPassParameters);
++}
++
++void SetupMobileShadowDepthPassVirtualShadowMapDummies(FRDGBuilder& GraphBuilder, FMobileShadowDepthPassUniformParameters& ShadowDepthPassParameters)
++{
++	const uint32 DummyPageTableElement = 0xFFFFFFFF;
++	ShadowDepthPassParameters.VirtualSmPageTable = GSystemTextures.GetDefaultTexture2D(GraphBuilder, PF_R32_UINT, DummyPageTableElement);
++	ShadowDepthPassParameters.PackedNaniteViews = GraphBuilder.CreateSRV(GSystemTextures.GetDefaultStructuredBuffer(GraphBuilder, sizeof(Nanite::FPackedView)));
++	ShadowDepthPassParameters.AllocatedPageRectBounds = GraphBuilder.CreateSRV(GSystemTextures.GetDefaultStructuredBuffer(GraphBuilder, sizeof(FIntVector4)));
++	ShadowDepthPassParameters.UncachedPageRectBounds = GraphBuilder.CreateSRV(GSystemTextures.GetDefaultStructuredBuffer(GraphBuilder, sizeof(FIntVector4)));
++	FRDGTextureRef DepthBufferArray = GraphBuilder.CreateTexture(FRDGTextureDesc::Create2DArray(FIntPoint(4, 4), PF_R32_UINT, FClearValueBinding::None, TexCreate_ShaderResource | TexCreate_UAV, 1), TEXT("Dummy-OutDepthBuffer"));
++	ShadowDepthPassParameters.OutDepthBufferArray = GraphBuilder.CreateUAV(DepthBufferArray);
+ }
+ 
+ void AddClearShadowDepthPass(FRDGBuilder& GraphBuilder, FRDGTextureRef Texture)
+@@ -414,7 +427,8 @@ EShadowDepthType GetPlatformSupportedShadowDepthTypes(EShaderPlatform Platform)
+ 		// Mobile only needs OutputDepth, and optionally PerspectiveCorrect and OnePassPointLight
+ 		Types |= EShadowDepthType::Directional
+ 			| (MobileUsesPerspectiveCorrectShadowPermutation(Platform) ? EShadowDepthType::Spot : EShadowDepthType::None)
+-			| (FReadOnlyCVARCache::EnablePointLightShadows(Platform) && bShouldCompileVSLayer ? EShadowDepthType::OnePassPoint : EShadowDepthType::None);
++			| (FReadOnlyCVARCache::EnablePointLightShadows(Platform) && bShouldCompileVSLayer ? EShadowDepthType::OnePassPoint : EShadowDepthType::None)
++			| (DoesPlatformSupportNonNaniteVirtualShadowMaps(Platform) ? EShadowDepthType::VSM : EShadowDepthType::None);
+ 	}
+ 	else
+ 	{
+@@ -2564,4 +2578,5 @@ FMeshPassProcessor* CreateVSMShadowDepthPassProcessor(ERHIFeatureLevel::Type Fea
+ 	return nullptr;
+ }
+ 
+-REGISTER_MESHPASSPROCESSOR_AND_PSOCOLLECTOR(VSMShadowDepthPass, CreateVSMShadowDepthPassProcessor, EShadingPath::Deferred, EMeshPass::VSMShadowDepth, EMeshPassFlags::CachedMeshCommands);
+\ No newline at end of file
++REGISTER_MESHPASSPROCESSOR_AND_PSOCOLLECTOR(VSMShadowDepthPass, CreateVSMShadowDepthPassProcessor, EShadingPath::Deferred, EMeshPass::VSMShadowDepth, EMeshPassFlags::CachedMeshCommands);
++REGISTER_MESHPASSPROCESSOR_AND_PSOCOLLECTOR(VSMMobileShadowDepthPass, CreateVSMShadowDepthPassProcessor, EShadingPath::Mobile, EMeshPass::VSMShadowDepth, EMeshPassFlags::CachedMeshCommands);
+\ No newline at end of file
+diff --git a/Engine/Source/Runtime/Renderer/Private/ShadowRendering.h b/Engine/Source/Runtime/Renderer/Private/ShadowRendering.h
+index 5e2c43300a91..aa77b3e809f5 100644
+--- a/Engine/Source/Runtime/Renderer/Private/ShadowRendering.h
++++ b/Engine/Source/Runtime/Renderer/Private/ShadowRendering.h
+@@ -328,8 +328,18 @@ BEGIN_GLOBAL_SHADER_PARAMETER_STRUCT(FMobileShadowDepthPassUniformParameters, RE
+ 	SHADER_PARAMETER(float, bClampToNearPlane)
+ 	SHADER_PARAMETER_ARRAY(FMatrix44f, ShadowViewProjectionMatrices, [6])
+ 	SHADER_PARAMETER(uint32, ShadowDepthType)
++
++	// Virtual shadow map rendering (r.Mobile.VirtualShadowMaps), dummies otherwise
++	SHADER_PARAMETER_RDG_TEXTURE(Texture2D<uint>, VirtualSmPageTable)
++	SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer< FPackedNaniteView >, PackedNaniteViews)
++	SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer< uint4 >, AllocatedPageRectBounds)
++	SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer< uint4 >, UncachedPageRectBounds)
++	SHADER_PARAMETER_RDG_TEXTURE_UAV(RWTexture2DArray< uint >, OutDepthBufferArray)
+ END_GLOBAL_SHADER_PARAMETER_STRUCT()
+ 
++/** Fills the virtual shadow map members of a mobile shadow depth pass with dummies, for passes that render no virtual shadow map. */
++void SetupMobileShadowDepthPassVirtualShadowMapDummies(FRDGBuilder& GraphBuilder, FMobileShadowDepthPassUniformParameters& ShadowDepthPassParameters);
++
+ /**
+  * Information about a projected shadow.
+  */
+diff --git a/Engine/Source/Runtime/Renderer/Private/Shadows/ShadowScene.cpp b/Engine/Source/Runtime/Renderer/Private/Shadows/ShadowScene.cpp
+index 6ca41bdb94ba..884c6e4b325e 100644
+--- a/Engine/Source/Runtime/Renderer/Private/Shadows/ShadowScene.cpp
++++ b/Engine/Source/Runtime/Renderer/Private/Shadows/ShadowScene.cpp
+@@ -4,6 +4,8 @@
+ #include "ScenePrivate.h"
+ #include "Algo/ForEach.h"
+ #include "ShadowSceneRenderer.h"
++#include "SceneRendering.h"
++#include "DeferredShadingRenderer.h"
+ 
+ #if !(UE_BUILD_SHIPPING || UE_BUILD_TEST)
+ #include "DynamicPrimitiveDrawing.h"
+@@ -306,5 +308,13 @@ ISceneExtensionRenderer* FShadowScene::CreateRenderer(FSceneRendererBase& InScen
+ 		return new FShadowSceneRenderer(*DeferredShadingSceneRenderer, *this);
+ 	}
+ 
++	if (FMobileSceneRenderer* MobileSceneRenderer = InSceneRenderer.GetMobileSceneRenderer())
++	{
++		if (IsMobileVirtualShadowMapsEnabled(MobileSceneRenderer->ShaderPlatform))
++		{
++			return new FShadowSceneRenderer(*MobileSceneRenderer, *this);
++		}
++	}
++
+ 	return nullptr;
+ }
+diff --git a/Engine/Source/Runtime/Renderer/Private/Shadows/ShadowSceneRenderer.cpp b/Engine/Source/Runtime/Renderer/Private/Shadows/ShadowSceneRenderer.cpp
+index 1153a341929e..e4d3e7ea5792 100644
+--- a/Engine/Source/Runtime/Renderer/Private/Shadows/ShadowSceneRenderer.cpp
++++ b/Engine/Source/Runtime/Renderer/Private/Shadows/ShadowSceneRenderer.cpp
+@@ -129,7 +129,7 @@ DECLARE_DWORD_COUNTER_STAT(TEXT("VSM Light Projections (Directional)"), STAT_VSM
+ DECLARE_DWORD_COUNTER_STAT(TEXT("VSM Light Projections (Local Full)"), STAT_VSMLocalProjectionFull, STATGROUP_ShadowRendering);
+ DECLARE_DWORD_COUNTER_STAT(TEXT("VSM Light Projections (Local One Pass Copy)"), STAT_VSMLocalProjectionOnePassCopy, STATGROUP_ShadowRendering);
+ 
+-FShadowSceneRenderer::FShadowSceneRenderer(FDeferredShadingSceneRenderer& InSceneRenderer, FShadowScene& InShadowScene)
++FShadowSceneRenderer::FShadowSceneRenderer(FSceneRenderer& InSceneRenderer, FShadowScene& InShadowScene)
+ 	: ISceneExtensionRenderer(InSceneRenderer)
+ 	, SceneRenderer(InSceneRenderer)
+ 	, Scene(InShadowScene.Scene)
+diff --git a/Engine/Source/Runtime/Renderer/Private/Shadows/ShadowSceneRenderer.h b/Engine/Source/Runtime/Renderer/Private/Shadows/ShadowSceneRenderer.h
+index 4e0f6a099cbd..be280a3a5073 100644
+--- a/Engine/Source/Runtime/Renderer/Private/Shadows/ShadowSceneRenderer.h
++++ b/Engine/Source/Runtime/Renderer/Private/Shadows/ShadowSceneRenderer.h
+@@ -13,6 +13,7 @@
+ 
+ class FProjectedShadowInfo;
+ class FDeferredShadingSceneRenderer;
++class FSceneRenderer;
+ class FWholeSceneProjectedShadowInitializer;
+ class FRDGBuilder;
+ class FVirtualShadowMapPerLightCacheEntry;
+@@ -48,7 +49,7 @@ class FShadowSceneRenderer : public ISceneExtensionRenderer
+ public:
+ 	DECLARE_SCENE_EXTENSION_RENDERER(FShadowSceneRenderer, FShadowScene);
+ 
+-	FShadowSceneRenderer(FDeferredShadingSceneRenderer& InDeferredShadingSceneRenderer, FShadowScene& InShadowScene);
++	FShadowSceneRenderer(FSceneRenderer& InSceneRenderer, FShadowScene& InShadowScene);
+ 
+ 	/**
+ 	 * Multiply PackedView.LODScale by return value when rendering Nanite shadows.
+@@ -273,7 +274,7 @@ private:
+ 	FDirectionalLightShadowFrameSetup* FindDirectional(const FLightSceneId LightId, int32 ViewIndex);
+ 
+ 	// Links to other systems etc.
+-	FDeferredShadingSceneRenderer& SceneRenderer;
++	FSceneRenderer& SceneRenderer;
+ 	FScene& Scene;
+ 	FShadowScene& ShadowScene;
+ 	FVirtualShadowMapArray& VirtualShadowMapArray;
+diff --git a/Engine/Source/Runtime/Renderer/Private/VirtualShadowMaps/VirtualShadowMapArray.cpp b/Engine/Source/Runtime/Renderer/Private/VirtualShadowMaps/VirtualShadowMapArray.cpp
+index d1f152d24d4a..dfbd2b0ade27 100644
+--- a/Engine/Source/Runtime/Renderer/Private/VirtualShadowMaps/VirtualShadowMapArray.cpp
++++ b/Engine/Source/Runtime/Renderer/Private/VirtualShadowMaps/VirtualShadowMapArray.cpp
+@@ -1376,6 +1376,12 @@ class FGeneratePageFlagsFromFroxelsCS : public FVirtualShadowMapPageManagementSh
+ 	class FThrottling : SHADER_PERMUTATION_BOOL("PERMUTATION_THROTTLING"); 
+ 	using FPermutationDomain = TShaderPermutationDomain<FDebugRenderDim, FThrottling>;
+ 
++	static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters& Parameters)
++	{
++		// The mobile renderer builds no froxels, and marks virtual shadow map pages from depth alone
++		return FVirtualShadowMapPageManagementShader::ShouldCompilePermutation(Parameters) && !IsMobilePlatform(Parameters.Platform);
++	}
++
+ 	static EShaderPermutationPrecacheRequest ShouldPrecachePermutation(const FGlobalShaderPermutationParameters& Parameters)
+ 	{
+ 		FPermutationDomain PermutationVector(Parameters.PermutationId);
+@@ -3535,6 +3541,12 @@ class FDebugVisualizeVirtualSmCS : public FVirtualShadowMapPageManagementShader
+ 	DECLARE_GLOBAL_SHADER(FDebugVisualizeVirtualSmCS);
+ 	SHADER_USE_PARAMETER_STRUCT(FDebugVisualizeVirtualSmCS, FVirtualShadowMapPageManagementShader)
+ 
++	static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters& Parameters)
++	{
++		// Debug output only, and FXC stalls on it for the mobile renderer's shader platforms
++		return FVirtualShadowMapPageManagementShader::ShouldCompilePermutation(Parameters) && !IsMobilePlatform(Parameters.Platform);
++	}
++
+ 	BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
+ 		SHADER_PARAMETER_STRUCT_INCLUDE(FVirtualShadowMapSamplingParameters, ProjectionParameters)
+ 		SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<FPhysicalPageMetaData>, PhysicalPageMetaData)
+@@ -3613,6 +3625,12 @@ class FVirtualSmLogStatsCS : public FVirtualShadowMapPageManagementShader
+ 	DECLARE_GLOBAL_SHADER(FVirtualSmLogStatsCS);
+ 	SHADER_USE_PARAMETER_STRUCT(FVirtualSmLogStatsCS, FVirtualShadowMapPageManagementShader)
+ 
++	static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters& Parameters)
++	{
++		// Debug output only, and FXC stalls on it for the mobile renderer's shader platforms
++		return FVirtualShadowMapPageManagementShader::ShouldCompilePermutation(Parameters) && !IsMobilePlatform(Parameters.Platform);
++	}
++
+ 	class FGenerateStatsDim : SHADER_PERMUTATION_BOOL("VSM_GENERATE_STATS"); 
+ 	using FPermutationDomain = TShaderPermutationDomain<FGenerateStatsDim>;
+ 
+@@ -3717,6 +3735,12 @@ class FVirtualSmLogPageListStatsCS : public FVirtualShadowMapPageManagementShade
+ 	DECLARE_GLOBAL_SHADER(FVirtualSmLogPageListStatsCS);
+ 	SHADER_USE_PARAMETER_STRUCT(FVirtualSmLogPageListStatsCS, FVirtualShadowMapPageManagementShader)
+ 
++	static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters& Parameters)
++	{
++		// Debug output only, and FXC stalls on it for the mobile renderer's shader platforms
++		return FVirtualShadowMapPageManagementShader::ShouldCompilePermutation(Parameters) && !IsMobilePlatform(Parameters.Platform);
++	}
++
+ 	BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
+ 		SHADER_PARAMETER_RDG_UNIFORM_BUFFER(FVirtualShadowMapUniformParameters, VirtualShadowMap)
+ 		SHADER_PARAMETER_STRUCT_INCLUDE(ShaderPrint::FShaderParameters, ShaderPrintStruct)
+@@ -3739,6 +3763,12 @@ class FVirtualSmPrintClipmapStatsCS : public FVirtualShadowMapPageManagementShad
+ 	DECLARE_GLOBAL_SHADER(FVirtualSmPrintClipmapStatsCS);
+ 	SHADER_USE_PARAMETER_STRUCT(FVirtualSmPrintClipmapStatsCS, FVirtualShadowMapPageManagementShader)
+ 
++	static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters& Parameters)
++	{
++		// Debug output only, and FXC stalls on it for the mobile renderer's shader platforms
++		return FVirtualShadowMapPageManagementShader::ShouldCompilePermutation(Parameters) && !IsMobilePlatform(Parameters.Platform);
++	}
++
+ 	BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
+ 		//SHADER_PARAMETER_RDG_UNIFORM_BUFFER(FVirtualShadowMapUniformParameters, VirtualShadowMap)
+ 		SHADER_PARAMETER_STRUCT_INCLUDE(ShaderPrint::FShaderParameters, ShaderPrintStruct)
+@@ -3753,6 +3783,7 @@ IMPLEMENT_GLOBAL_SHADER(FVirtualSmPrintClipmapStatsCS, "/Engine/Private/VirtualS
+ BEGIN_SHADER_PARAMETER_STRUCT(FVirtualShadowDepthPassParameters,)
+ 	SHADER_PARAMETER_STRUCT_REF(FViewUniformShaderParameters, View)
+ 	SHADER_PARAMETER_RDG_UNIFORM_BUFFER(FShadowDepthPassUniformParameters, ShadowDepthPass)
++	SHADER_PARAMETER_RDG_UNIFORM_BUFFER(FMobileShadowDepthPassUniformParameters, MobileShadowDepthPass)
+ 	SHADER_PARAMETER_RDG_UNIFORM_BUFFER(FVirtualShadowMapUniformParameters, VirtualShadowMap)
+ 	SHADER_PARAMETER_STRUCT_INCLUDE(FInstanceCullingDrawParams, InstanceCullingDrawParams)
+ 
+@@ -3778,8 +3809,7 @@ class FCullPerPageDrawCommandsCs : public FGlobalShader
+ public:
+ 	static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters& Parameters)
+ 	{
+-		return IsFeatureLevelSupported(Parameters.Platform, ERHIFeatureLevel::SM5) &&
+-			DoesPlatformSupportVirtualShadowMaps(Parameters.Platform);
++		return DoesPlatformSupportVirtualShadowMaps(Parameters.Platform);
+ 	}
+ 
+ 	/**
+@@ -3858,8 +3888,7 @@ public:
+ 
+ 	static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters& Parameters)
+ 	{
+-		return IsFeatureLevelSupported(Parameters.Platform, ERHIFeatureLevel::SM5) &&
+-			DoesPlatformSupportVirtualShadowMaps(Parameters.Platform);
++		return DoesPlatformSupportVirtualShadowMaps(Parameters.Platform);
+ 	}
+ 
+ 	/**
+@@ -3896,8 +3925,7 @@ public:
+ 
+ 	static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters& Parameters)
+ 	{
+-		return IsFeatureLevelSupported(Parameters.Platform, ERHIFeatureLevel::SM5) &&
+-			DoesPlatformSupportVirtualShadowMaps(Parameters.Platform);
++		return DoesPlatformSupportVirtualShadowMaps(Parameters.Platform);
+ 	}
+ 
+ 	/**
+@@ -4135,11 +4163,18 @@ FVSMRenderViewCount GetRenderViewCount(const FProjectedShadowInfo* ProjectedShad
+ 	}
+ }
+ 
++/** The shadow depth pass uniform buffer for the scene's shading path: the mobile renderer's shadow depth shaders read their own struct. */
++struct FVirtualShadowDepthPassUniformBuffers
++{
++	TRDGUniformBufferRef<FShadowDepthPassUniformParameters> Deferred = nullptr;
++	TRDGUniformBufferRef<FMobileShadowDepthPassUniformParameters> Mobile = nullptr;
++};
++
+ static void AddRasterPass(
+ 	FRDGBuilder& GraphBuilder, 
+ 	FRDGEventName&& PassName,
+ 	const FViewInfo* ShadowDepthView, 
+-	const TRDGUniformBufferRef<FShadowDepthPassUniformParameters>& ShadowDepthPassUniformBuffer,
++	const FVirtualShadowDepthPassUniformBuffers& ShadowDepthPassUniformBuffer,
+ 	FVirtualShadowMapArray& VirtualShadowMapArray,
+ 	FRDGBufferRef VirtualShadowViewsRDG,
+ 	const FCullingResult& CullingResult, 
+@@ -4149,7 +4184,8 @@ static void AddRasterPass(
+ 	TRDGUniformBufferRef<FSceneUniformParameters> SceneUB)
+ {
+ 	PassParameters->View = ShadowDepthView->ViewUniformBuffer;
+-	PassParameters->ShadowDepthPass = ShadowDepthPassUniformBuffer;
++	PassParameters->ShadowDepthPass = ShadowDepthPassUniformBuffer.Deferred;
++	PassParameters->MobileShadowDepthPass = ShadowDepthPassUniformBuffer.Mobile;
+ 
+ 	PassParameters->VirtualShadowMap = VirtualShadowMapArray.GetUniformBuffer(0);
+ 	PassParameters->InViews = GraphBuilder.CreateSRV(VirtualShadowViewsRDG);
+@@ -4512,7 +4548,7 @@ void FVirtualShadowMapArray::RenderVirtualShadowMapsNonNanite(FRDGBuilder& Graph
+ 
+ 	// Helper function to create raster pass UB - only really need two of these ever
+ 	const FSceneTextures* SceneTextures = &GetViewFamilyInfo(Views).GetSceneTextures();
+-	auto CreateShadowDepthPassUniformBuffer = [this, &VirtualShadowViewsRDG, &GraphBuilder, SceneTextures](bool bClampToNearPlane)
++	auto CreateDeferredShadowDepthPassUniformBuffer = [this, &VirtualShadowViewsRDG, &GraphBuilder, SceneTextures](bool bClampToNearPlane)
+ 	{
+ 		FShadowDepthPassUniformParameters* ShadowDepthPassParameters = GraphBuilder.AllocParameters<FShadowDepthPassUniformParameters>();
+ 		check(PhysicalPagePoolRDG != nullptr);
+@@ -4533,6 +4569,41 @@ void FVirtualShadowMapArray::RenderVirtualShadowMapsNonNanite(FRDGBuilder& Graph
+ 		return GraphBuilder.CreateUniformBuffer(ShadowDepthPassParameters);
+ 	};
+ 
++	auto CreateMobileShadowDepthPassUniformBuffer = [this, &VirtualShadowViewsRDG, &GraphBuilder, SceneTextures](bool bClampToNearPlane)
++	{
++		FMobileShadowDepthPassUniformParameters* ShadowDepthPassParameters = GraphBuilder.AllocParameters<FMobileShadowDepthPassUniformParameters>();
++		check(PhysicalPagePoolRDG != nullptr);
++		ShadowDepthPassParameters->ProjectionMatrix = FMatrix44f::Identity;
++		ShadowDepthPassParameters->ViewMatrix = FMatrix44f::Identity;
++		ShadowDepthPassParameters->ShadowParams = FVector4f(0.0f, 0.0f, 0.0f, 1.0f);
++		ShadowDepthPassParameters->ShadowDepthType = (uint32)EShadowDepthType::VSM;
++
++		ShadowDepthPassParameters->VirtualSmPageTable = PageTableRDG;
++		ShadowDepthPassParameters->PackedNaniteViews = GraphBuilder.CreateSRV(VirtualShadowViewsRDG);
++		ShadowDepthPassParameters->AllocatedPageRectBounds = GraphBuilder.CreateSRV(AllocatedPageRectBoundsRDG);
++		ShadowDepthPassParameters->UncachedPageRectBounds = GraphBuilder.CreateSRV(UncachedPageRectBoundsRDG);
++		ShadowDepthPassParameters->OutDepthBufferArray = GraphBuilder.CreateUAV(PhysicalPagePoolRDG, ERDGUnorderedAccessViewFlags::SkipBarrier);
++		SetupMobileSceneTextureUniformParameters(GraphBuilder, SceneTextures, EMobileSceneTextureSetupMode::None, ShadowDepthPassParameters->SceneTextures);
++		ShadowDepthPassParameters->bClampToNearPlane = bClampToNearPlane;
++
++		return GraphBuilder.CreateUniformBuffer(ShadowDepthPassParameters);
++	};
++
++	const bool bMobileShadingPath = GetFeatureLevelShadingPath(Scene.GetFeatureLevel()) == EShadingPath::Mobile;
++	auto CreateShadowDepthPassUniformBuffer = [&](bool bClampToNearPlane)
++	{
++		FVirtualShadowDepthPassUniformBuffers Result;
++		if (bMobileShadingPath)
++		{
++			Result.Mobile = CreateMobileShadowDepthPassUniformBuffer(bClampToNearPlane);
++		}
++		else
++		{
++			Result.Deferred = CreateDeferredShadowDepthPassUniformBuffer(bClampToNearPlane);
++		}
++		return Result;
++	};
++
+ 	FCullPerPageDrawCommandsCs::FHZBShaderParameters HZBShaderParameters;
+ 	if (HZBTextureArray)
+ 	{
+@@ -4584,7 +4655,7 @@ void FVirtualShadowMapArray::RenderVirtualShadowMapsNonNanite(FRDGBuilder& Graph
+ 		    );
+ 		}
+ 
+-		TRDGUniformBufferRef<FShadowDepthPassUniformParameters> ShadowDepthPassUniformBuffer = CreateShadowDepthPassUniformBuffer(false);
++		FVirtualShadowDepthPassUniformBuffers ShadowDepthPassUniformBuffer = CreateShadowDepthPassUniformBuffer(false);
+ 
+ 		FInstanceCullingGlobalUniforms* InstanceCullingGlobalUniforms = GraphBuilder.AllocParameters<FInstanceCullingGlobalUniforms>();
+ 		InstanceCullingGlobalUniforms->InstanceIdsBuffer = GraphBuilder.CreateSRV(CullingResult.InstanceIdsBuffer);
+@@ -4601,7 +4672,8 @@ void FVirtualShadowMapArray::RenderVirtualShadowMapsNonNanite(FRDGBuilder& Graph
+ 				FViewInfo* ShadowDepthView = ProjectedShadowInfo0->ShadowDepthView;
+ 
+ 				PassParameters->View = ShadowDepthView->ViewUniformBuffer;
+-				PassParameters->ShadowDepthPass = ShadowDepthPassUniformBuffer;
++				PassParameters->ShadowDepthPass = ShadowDepthPassUniformBuffer.Deferred;
++				PassParameters->MobileShadowDepthPass = ShadowDepthPassUniformBuffer.Mobile;
+ 
+ 				PassParameters->VirtualShadowMap = GetUniformBuffer(0);
+ 				PassParameters->InViews = GraphBuilder.CreateSRV(VirtualShadowViewsRDG);
+@@ -4716,7 +4788,7 @@ void FVirtualShadowMapArray::RenderVirtualShadowMapsNonNanite(FRDGBuilder& Graph
+ 				FDataDrivenShaderPlatformInfo::GetMaxFeatureLevel(GPUScene.GetShaderPlatform())
+ 			);
+ 
+-			TRDGUniformBufferRef<FShadowDepthPassUniformParameters> ShadowDepthPassUniformBuffer = CreateShadowDepthPassUniformBuffer(ProjectedShadowInfo->ShouldClampToNearPlane());
++			FVirtualShadowDepthPassUniformBuffers ShadowDepthPassUniformBuffer = CreateShadowDepthPassUniformBuffer(ProjectedShadowInfo->ShouldClampToNearPlane());
+ 
+ 			FInstanceCullingGlobalUniforms* InstanceCullingGlobalUniforms = GraphBuilder.AllocParameters<FInstanceCullingGlobalUniforms>();
+ 			InstanceCullingGlobalUniforms->InstanceIdsBuffer = GraphBuilder.CreateSRV(CullingResult.InstanceIdsBuffer);
+@@ -4732,7 +4804,7 @@ void FVirtualShadowMapArray::RenderVirtualShadowMapsNonNanite(FRDGBuilder& Graph
+ 
+ 
+ 		//
+-		if (Index == CVarShowClipmapStats.GetValueOnRenderThread())
++		if (Index == CVarShowClipmapStats.GetValueOnRenderThread() && !IsMobilePlatform(GPUScene.GetShaderPlatform()))
+ 		{
+ 			// The 'main' view the shadow was created with respect to
+ 			const FViewInfo* ViewUsedToCreateShadow = ProjectedShadowInfo->DependentView;
+@@ -5245,8 +5317,7 @@ class FDrawShadowCastersFalseColor : public FGlobalShader
+ 
+ 	static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters& Parameters)
+ 	{
+-		return IsFeatureLevelSupported(Parameters.Platform, ERHIFeatureLevel::SM5) &&
+-			DoesPlatformSupportVirtualShadowMaps(Parameters.Platform);
++		return DoesPlatformSupportVirtualShadowMaps(Parameters.Platform);
+ 	}
+ 
+ 	static void ModifyCompilationEnvironment(const FGlobalShaderPermutationParameters& Parameters, FShaderCompilerEnvironment& OutEnvironment)
+@@ -5267,7 +5338,6 @@ public:
+ 	static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters& Parameters)
+ 	{
+ 		return 
+-			IsFeatureLevelSupported(Parameters.Platform, ERHIFeatureLevel::SM5) &&
+ 			DoesPlatformSupportVirtualShadowMaps(Parameters.Platform) &&
+ 			FDataDrivenShaderPlatformInfo::GetSupportsVertexShaderSRVs(Parameters.Platform);
+ 	}
+@@ -5311,7 +5381,6 @@ public:
+ 		}
+ 
+ 		return 
+-			IsFeatureLevelSupported(Parameters.Platform, ERHIFeatureLevel::SM5) &&
+ 			DoesPlatformSupportVirtualShadowMaps(Parameters.Platform) &&
+ 			FDataDrivenShaderPlatformInfo::GetSupportsVertexShaderSRVs(Parameters.Platform);
+ 	}
+diff --git a/Engine/Source/Runtime/Renderer/Private/VirtualShadowMaps/VirtualShadowMapCacheManager.cpp b/Engine/Source/Runtime/Renderer/Private/VirtualShadowMaps/VirtualShadowMapCacheManager.cpp
+index 6fffe52d8b4b..27ffe7d34819 100644
+--- a/Engine/Source/Runtime/Renderer/Private/VirtualShadowMaps/VirtualShadowMapCacheManager.cpp
++++ b/Engine/Source/Runtime/Renderer/Private/VirtualShadowMaps/VirtualShadowMapCacheManager.cpp
+@@ -1393,8 +1393,7 @@ public:
+ 	
+ 	static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters& Parameters)
+ 	{
+-		return IsFeatureLevelSupported(Parameters.Platform, ERHIFeatureLevel::SM5) &&
+-			DoesPlatformSupportVirtualShadowMaps(Parameters.Platform);
++		return DoesPlatformSupportVirtualShadowMaps(Parameters.Platform);
+ 	}
+ 
+ 	static void ModifyCompilationEnvironment(const FGlobalShaderPermutationParameters& Parameters, FShaderCompilerEnvironment& OutEnvironment)
+@@ -1711,8 +1710,7 @@ public:
+ 
+ 	static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters& Parameters)
+ 	{
+-		return IsFeatureLevelSupported(Parameters.Platform, ERHIFeatureLevel::SM5) &&
+-			DoesPlatformSupportVirtualShadowMaps(Parameters.Platform);
++		return DoesPlatformSupportVirtualShadowMaps(Parameters.Platform);
+ 	}
+ 
+ 	static void ModifyCompilationEnvironment(const FGlobalShaderPermutationParameters& Parameters, FShaderCompilerEnvironment& OutEnvironment)
+@@ -1749,8 +1747,7 @@ public:
+ 
+ 	static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters& Parameters)
+ 	{
+-		return IsFeatureLevelSupported(Parameters.Platform, ERHIFeatureLevel::SM5) &&
+-			DoesPlatformSupportVirtualShadowMaps(Parameters.Platform);
++		return DoesPlatformSupportVirtualShadowMaps(Parameters.Platform);
+ 	}
+ 
+ 	static void ModifyCompilationEnvironment(const FGlobalShaderPermutationParameters& Parameters, FShaderCompilerEnvironment& OutEnvironment)
+diff --git a/Engine/Source/Runtime/Renderer/Private/VirtualShadowMaps/VirtualShadowMapProjection.cpp b/Engine/Source/Runtime/Renderer/Private/VirtualShadowMaps/VirtualShadowMapProjection.cpp
+index bc54c15d5204..60d1c15c7ff4 100644
+--- a/Engine/Source/Runtime/Renderer/Private/VirtualShadowMaps/VirtualShadowMapProjection.cpp
++++ b/Engine/Source/Runtime/Renderer/Private/VirtualShadowMaps/VirtualShadowMapProjection.cpp
+@@ -239,7 +239,7 @@ class FVirtualShadowMapProjectionCS : public FGlobalShader
+ 				#endif
+ 			)
+ 			{
+-				return DoesPlatformSupportVirtualShadowMaps(Parameters.Platform);
++				return DoesPlatformSupportVirtualShadowMaps(Parameters.Platform) && !IsMobilePlatform(Parameters.Platform);
+ 			}
+ 			else
+ 			{
+@@ -272,7 +272,7 @@ class FVirtualShadowMapProjectionCS : public FGlobalShader
+ 			return false;
+ 		}
+ 
+-		return DoesPlatformSupportVirtualShadowMaps(Parameters.Platform);
++		return DoesPlatformSupportVirtualShadowMaps(Parameters.Platform) && !IsMobilePlatform(Parameters.Platform);
+ 	}
+ 
+ 	static FPermutationDomain RemapPermutation(FPermutationDomain PermutationVector)
+@@ -662,7 +662,7 @@ class FVirtualShadowMapProjectionCompositeTileVS : public FGlobalShader
+ 
+ 	static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters& Parameters)
+ 	{
+-		return DoesPlatformSupportVirtualShadowMaps(Parameters.Platform);
++		return DoesPlatformSupportVirtualShadowMaps(Parameters.Platform) && !IsMobilePlatform(Parameters.Platform);
+ 	}
+ 
+ 	static void ModifyCompilationEnvironment(const FGlobalShaderPermutationParameters& Parameters, FShaderCompilerEnvironment& OutEnvironment)
+@@ -689,7 +689,7 @@ class FVirtualShadowMapProjectionCompositePS : public FGlobalShader
+ 
+ 	static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters& Parameters)
+ 	{
+-		return DoesPlatformSupportVirtualShadowMaps(Parameters.Platform);
++		return DoesPlatformSupportVirtualShadowMaps(Parameters.Platform) && !IsMobilePlatform(Parameters.Platform);
+ 	}
+ 
+ 	static void ModifyCompilationEnvironment(const FGlobalShaderPermutationParameters& Parameters, FShaderCompilerEnvironment& OutEnvironment)
+@@ -818,7 +818,7 @@ class FVirtualShadowMapProjectionCompositeFromMaskBitsPS : public FGlobalShader
+ 
+ 	static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters& Parameters)
+ 	{
+-		return DoesPlatformSupportVirtualShadowMaps(Parameters.Platform);
++		return DoesPlatformSupportVirtualShadowMaps(Parameters.Platform) && !IsMobilePlatform(Parameters.Platform);
+ 	}
+ 
+ 	static void ModifyCompilationEnvironment(const FGlobalShaderPermutationParameters& Parameters, FShaderCompilerEnvironment& OutEnvironment)
+diff --git a/Engine/Source/Runtime/Renderer/Private/VirtualShadowMaps/VirtualShadowMapShaders.h b/Engine/Source/Runtime/Renderer/Private/VirtualShadowMaps/VirtualShadowMapShaders.h
+index b12b902db68f..d3af38b47cbd 100644
+--- a/Engine/Source/Runtime/Renderer/Private/VirtualShadowMaps/VirtualShadowMapShaders.h
++++ b/Engine/Source/Runtime/Renderer/Private/VirtualShadowMaps/VirtualShadowMapShaders.h
+@@ -23,8 +23,7 @@ public:
+ 
+ 	static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters& Parameters)
+ 	{
+-		return IsFeatureLevelSupported(Parameters.Platform, ERHIFeatureLevel::SM5) &&
+-			DoesPlatformSupportVirtualShadowMaps(Parameters.Platform);
++		return DoesPlatformSupportVirtualShadowMaps(Parameters.Platform);
+ 	}
+ 
+ 	static void ModifyCompilationEnvironment(const FGlobalShaderPermutationParameters& Parameters, FShaderCompilerEnvironment& OutEnvironment)

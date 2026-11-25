@@ -1,0 +1,350 @@
+diff --git a/Engine/Shaders/Private/MobileMSAAVelocityResolve.usf b/Engine/Shaders/Private/MobileMSAAVelocityResolve.usf
+new file mode 100644
+index 000000000000..2770b38a05f7
+--- /dev/null
++++ b/Engine/Shaders/Private/MobileMSAAVelocityResolve.usf
+@@ -0,0 +1,26 @@
++// Copyright (c) 2026 Jared Taylor.
++
++#include "Common.ush"
++
++Texture2DMS<float4> VelocityMS;
++RWTexture2D<float4> RWVelocity;
++int2 Extent;
++uint NumSamples;
++
++[numthreads(GROUP_SIZE, GROUP_SIZE, 1)]
++void MainCS(uint2 DispatchThreadId : SV_DispatchThreadID)
++{
++	if (any(int2(DispatchThreadId) >= Extent))
++	{
++		return;
++	}
++
++	// Encoded velocity is zero where the camera alone moved, so averaging samples would corrupt a mover's edge.
++	// Keep the first sample that carries object motion.
++	float4 Velocity = VelocityMS.Load(DispatchThreadId, 0);
++	for (uint SampleIndex = 1; SampleIndex < NumSamples && Velocity.x <= 0.0; ++SampleIndex)
++	{
++		Velocity = VelocityMS.Load(DispatchThreadId, SampleIndex);
++	}
++	RWVelocity[DispatchThreadId] = Velocity;
++}
+diff --git a/Engine/Source/Runtime/RenderCore/Private/RenderUtils.cpp b/Engine/Source/Runtime/RenderCore/Private/RenderUtils.cpp
+index b1230e6e38a2..2285dd4d0b1e 100644
+--- a/Engine/Source/Runtime/RenderCore/Private/RenderUtils.cpp
++++ b/Engine/Source/Runtime/RenderCore/Private/RenderUtils.cpp
+@@ -1265,7 +1265,7 @@ RENDERCORE_API bool PlatformSupportsVelocityRendering(const FStaticShaderPlatfor
+ 	if (IsMobilePlatform(Platform))
+ 	{
+ 		// Enable velocity rendering if desktop Gen4 TAA is supported on mobile or we're performing direct OpenXR motion vector rendering for frame synthesis.
+-		return SupportsGen4TAA(Platform) || PlatformSupportsOpenXRMotionVectors(Platform);
++		return SupportsGen4TAA(Platform) || PlatformSupportsOpenXRMotionVectors(Platform) || MobileSSRUsesVelocity(Platform);
+ 	}
+ 
+ 	return true;
+@@ -1746,6 +1746,13 @@ bool IsMobileForwardNormalTargetEnabled(const FStaticShaderPlatform Platform)
+ 	return IsMobilePlatform(Platform) && !IsMobileDeferredShadingEnabled(Platform) && MobileForwardNormalTarget.Get(Platform);
+ }
+ 
++bool MobileSSRUsesVelocity(const FStaticShaderPlatform Platform)
++{
++	static FShaderPlatformCachedIniValue<bool> MobileSSRVelocity(TEXT("r.Mobile.ScreenSpaceReflections.Velocity"));
++	// OpenGL velocity uses integer formats, which the MSAA velocity resolve does not read
++	return AreMobileScreenSpaceReflectionsEnabled(Platform) && !IsOpenGLPlatform(Platform) && MobileSSRVelocity.Get(Platform);
++}
++
+ bool IsStencilForLODDitherEnabled(const FStaticShaderPlatform Platform)
+ {
+ 	if (IsMobilePlatform(Platform) && !FReadOnlyCVARCache::MobileAllowDitheredLODTransition(Platform))
+diff --git a/Engine/Source/Runtime/RenderCore/Private/Shader.cpp b/Engine/Source/Runtime/RenderCore/Private/Shader.cpp
+index c5c6de81c34a..e203a258638f 100644
+--- a/Engine/Source/Runtime/RenderCore/Private/Shader.cpp
++++ b/Engine/Source/Runtime/RenderCore/Private/Shader.cpp
+@@ -2078,6 +2078,13 @@ void ShaderMapAppendKey(EShaderPlatform Platform, FShaderKeyGenerator& KeyGen)
+ 					KeyGen.AppendSeparator();
+ 					KeyGen.Append(TEXT("MobFNT"));
+ 				}
++
++				if (MobileSSRUsesVelocity(Platform))
++				{
++					KeyGen.AppendSeparator();
++					KeyGen.Append(TEXT("MobSSRV"));
++				}
++
+ 			}
+ 		}
+ 
+diff --git a/Engine/Source/Runtime/RenderCore/Public/RenderUtils.h b/Engine/Source/Runtime/RenderCore/Public/RenderUtils.h
+index 8c0286a82413..d47c5f99f8c7 100644
+--- a/Engine/Source/Runtime/RenderCore/Public/RenderUtils.h
++++ b/Engine/Source/Runtime/RenderCore/Public/RenderUtils.h
+@@ -371,6 +371,9 @@ RENDERCORE_API bool IsMobileDistanceFieldAOEnabled(const FStaticShaderPlatform P
+ /** Returns if the mobile forward base pass writes world normals to a render target for post-process materials. */
+ RENDERCORE_API bool IsMobileForwardNormalTargetEnabled(const FStaticShaderPlatform Platform);
+ 
++/** Returns if mobile screen space reflections reproject hits by the velocity texture, which renders velocities without temporal AA. */
++RENDERCORE_API bool MobileSSRUsesVelocity(const FStaticShaderPlatform Platform);
++
+ /** Returns if Stencil For LOD Dither is Enabled for this ShaderPlatform. */
+ RENDERCORE_API bool IsStencilForLODDitherEnabled(const FStaticShaderPlatform Platform);
+ 
+diff --git a/Engine/Source/Runtime/Renderer/Private/MobileBasePassRendering.cpp b/Engine/Source/Runtime/Renderer/Private/MobileBasePassRendering.cpp
+index 41b562df9110..12268f681c1b 100644
+--- a/Engine/Source/Runtime/Renderer/Private/MobileBasePassRendering.cpp
++++ b/Engine/Source/Runtime/Renderer/Private/MobileBasePassRendering.cpp
+@@ -7,6 +7,7 @@
+ #include "MobileBasePassRendering.h"
+ #include "MobileHeightFieldAORendering.h"
+ #include "MobileClusteredDecals.h"
++#include "MobileSSR.h"
+ #include "DynamicPrimitiveDrawing.h"
+ #include "ScenePrivate.h"
+ #include "SceneProxies/SkyLightSceneProxy.h"
+@@ -296,6 +297,15 @@ void MobileBasePassModifyCompilationEnvironment(const FMaterialShaderPermutation
+ 	OutEnvironment.SetDefine(TEXT("MOBILE_TRANSLUCENT_MSAA_DEPTH"), bTranslucentMSAADepth ? 1u : 0u);
+ 	OutEnvironment.SetDefine(TEXT("MOBILE_HEIGHTFIELD_GI"), !bDeferredShadingEnabled && IsMobileHeightFieldGIEnabled() ? 1u : 0u);
+ 	OutEnvironment.SetDefine(TEXT("MOBILE_CLUSTERED_DECALS"), !bTranslucentMaterial && IsMobileClusteredDecalsEnabled(Parameters.Platform) ? 1u : 0u);
++	if (!bDeferredShadingEnabled && AreMobileScreenSpaceReflectionsEnabled(Parameters.Platform))
++	{
++		// EMobileSSRQuality: Medium samples the velocity texture, Low reprojects by camera motion only
++		OutEnvironment.SetDefine(TEXT("MOBILE_SSR_QUALITY"), MobileSSRUsesVelocity(Parameters.Platform) ? 2u : 1u);
++		if (const int32 Steps = GetMobileSSRSteps())
++		{
++			OutEnvironment.SetDefine(TEXT("MOBILE_SSR_STEPS"), Steps);
++		}
++	}
+ }
+ 
+ template<typename LightMapPolicyType>
+diff --git a/Engine/Source/Runtime/Renderer/Private/MobileSSR.cpp b/Engine/Source/Runtime/Renderer/Private/MobileSSR.cpp
+index 361e9b0a0394..b10741f23ccc 100644
+--- a/Engine/Source/Runtime/Renderer/Private/MobileSSR.cpp
++++ b/Engine/Source/Runtime/Renderer/Private/MobileSSR.cpp
+@@ -8,6 +8,9 @@
+ #include "PostProcess/SceneRenderTargets.h"
+ #include "SystemTextures.h"
+ #include "SceneViewState.h"
++#include "SceneTextures.h"
++#include "VelocityRendering.h"
++#include "ProfilingDebugging/CpuProfilerTrace.h"
+ 
+ int32 GMobileScreenSpaceReflectionsSupported = 0;
+ static FAutoConsoleVariableRef CVarMobileScreenSpaceReflections(
+@@ -34,6 +37,26 @@ static FAutoConsoleVariableRef CVarMobileSSRCameraLockedDistance(
+ 	TEXT("0: off (stock)"),
+ 	ECVF_RenderThreadSafe);
+ 
++static TAutoConsoleVariable<int32> CVarMobileSSRVelocity(
++	TEXT("r.Mobile.ScreenSpaceReflections.Velocity"),
++	0,
++	TEXT("Renders velocities for mobile forward screen space reflections without temporal AA, MSAA included, so a reflected hit on a moving object reprojects by its own motion instead of the camera's. ")
++	TEXT("Also raises the ray steps from 8 to 12.\n")
++	TEXT("Read only, recompiles materials."),
++	ECVF_ReadOnly | ECVF_RenderThreadSafe);
++
++static TAutoConsoleVariable<int32> CVarMobileSSRSteps(
++	TEXT("r.Mobile.ScreenSpaceReflections.Steps"),
++	0,
++	TEXT("Ray march steps for mobile forward screen space reflections. 0 keeps the default: 8, or 12 with r.Mobile.ScreenSpaceReflections.Velocity.\n")
++	TEXT("Read only, recompiles materials."),
++	ECVF_ReadOnly | ECVF_RenderThreadSafe);
++
++int32 GetMobileSSRSteps()
++{
++	return FMath::Clamp(CVarMobileSSRSteps.GetValueOnAnyThread(), 0, 64);
++}
++
+ bool IsMobileSSREnabled(const FViewInfo& View)
+ {
+ 	const EShaderPlatform Platform = View.GetShaderPlatform();
+@@ -149,3 +172,59 @@ void SetupMobileSSRParameters(FRDGBuilder& GraphBuilder,const FViewInfo& View, F
+ 	}
+ }
+ 
++class FMobileMSAAVelocityResolveCS : public FGlobalShader
++{
++	DECLARE_GLOBAL_SHADER(FMobileMSAAVelocityResolveCS);
++	SHADER_USE_PARAMETER_STRUCT(FMobileMSAAVelocityResolveCS, FGlobalShader);
++
++	BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
++		SHADER_PARAMETER_RDG_TEXTURE(Texture2DMS<float4>, VelocityMS)
++		SHADER_PARAMETER_RDG_TEXTURE_UAV(RWTexture2D<float4>, RWVelocity)
++		SHADER_PARAMETER(FIntPoint, Extent)
++		SHADER_PARAMETER(uint32, NumSamples)
++	END_SHADER_PARAMETER_STRUCT()
++
++	static constexpr int32 GroupSize = 8;
++
++	static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters& Parameters)
++	{
++		return MobileSSRUsesVelocity(Parameters.Platform);
++	}
++
++	static void ModifyCompilationEnvironment(const FGlobalShaderPermutationParameters& Parameters, FShaderCompilerEnvironment& OutEnvironment)
++	{
++		FGlobalShader::ModifyCompilationEnvironment(Parameters, OutEnvironment);
++		OutEnvironment.SetDefine(TEXT("GROUP_SIZE"), GroupSize);
++	}
++};
++
++IMPLEMENT_GLOBAL_SHADER(FMobileMSAAVelocityResolveCS, "/Engine/Private/MobileMSAAVelocityResolve.usf", "MainCS", SF_Compute);
++
++void FMobileSceneRenderer::RenderMSAAVelocities(FRDGBuilder& GraphBuilder, FSceneTextures& SceneTextures)
++{
++	TRACE_CPUPROFILER_EVENT_SCOPE(MobileSceneRenderer::RenderMSAAVelocities);
++
++	RDG_EVENT_SCOPE(GraphBuilder, "MSAAVelocities");
++
++	const uint32 NumSamples = SceneTextures.Depth.Target->Desc.NumSamples;
++	FRDGTextureDesc MSAADesc = SceneTextures.Velocity->Desc;
++	MSAADesc.NumSamples = NumSamples;
++	MSAADesc.Flags = TexCreate_RenderTargetable | TexCreate_ShaderResource;
++	FRDGTextureRef VelocityMS = GraphBuilder.CreateTexture(MSAADesc, TEXT("MobileVelocityMS"));
++
++	RenderVelocities(GraphBuilder, Views, SceneTextures, EVelocityPass::Opaque, /*bForceVelocity*/ true, /*bBindRenderTarget*/ true, VelocityMS, SceneTextures.Depth.Target);
++
++	FMobileMSAAVelocityResolveCS::FParameters* PassParameters = GraphBuilder.AllocParameters<FMobileMSAAVelocityResolveCS::FParameters>();
++	PassParameters->VelocityMS = VelocityMS;
++	PassParameters->RWVelocity = GraphBuilder.CreateUAV(SceneTextures.Velocity);
++	PassParameters->Extent = SceneTextures.Velocity->Desc.Extent;
++	PassParameters->NumSamples = NumSamples;
++
++	TShaderMapRef<FMobileMSAAVelocityResolveCS> ComputeShader(GetGlobalShaderMap(FeatureLevel));
++	FComputeShaderUtils::AddPass(
++		GraphBuilder,
++		RDG_EVENT_NAME("ResolveVelocity %dx%d", PassParameters->Extent.X, PassParameters->Extent.Y),
++		ComputeShader,
++		PassParameters,
++		FComputeShaderUtils::GetGroupCount(PassParameters->Extent, FMobileMSAAVelocityResolveCS::GroupSize));
++}
+diff --git a/Engine/Source/Runtime/Renderer/Private/MobileSSR.h b/Engine/Source/Runtime/Renderer/Private/MobileSSR.h
+index 6fb1a114bb3b..697bf40d3649 100644
+--- a/Engine/Source/Runtime/Renderer/Private/MobileSSR.h
++++ b/Engine/Source/Runtime/Renderer/Private/MobileSSR.h
+@@ -29,4 +29,7 @@ enum class EMobileSSRQuality
+ 
+ bool IsMobileSSREnabled(const FViewInfo& View);
+ EMobileSSRQuality ActiveMobileSSRQuality(const FViewInfo& View, bool bHasVelocityTexture);
++
++/** r.Mobile.ScreenSpaceReflections.Steps, or 0 for the shader's default. */
++int32 GetMobileSSRSteps();
+ void SetupMobileSSRParameters(FRDGBuilder& GraphBuilder, const FViewInfo& View, FMobileScreenSpaceReflectionParams& Params);
+diff --git a/Engine/Source/Runtime/Renderer/Private/MobileShadingRenderer.cpp b/Engine/Source/Runtime/Renderer/Private/MobileShadingRenderer.cpp
+index 3b2810e2e7d2..73e96ecba194 100644
+--- a/Engine/Source/Runtime/Renderer/Private/MobileShadingRenderer.cpp
++++ b/Engine/Source/Runtime/Renderer/Private/MobileShadingRenderer.cpp
+@@ -952,7 +952,9 @@ void FMobileSceneRenderer::RenderFullDepthPrepass(FRDGBuilder& GraphBuilder, TAr
+ 		auto ParameterCollection = GraphBuilder.AllocParameters<FFullDepthPrepassParameterCollection>();
+ 
+ 		auto PassParameters = &ParameterCollection->PassParameters;
+-		if (bShouldRenderVelocities)
++		// Velocity has one sample, so under MSAA it renders in its own pass (RenderMSAAVelocities)
++		const bool bBindVelocity = bShouldRenderVelocities && DepthTargetTexture->Desc.NumSamples == 1;
++		if (bBindVelocity)
+ 		{
+ 			PassParameters->RenderTargets[0] = FRenderTargetBinding(SceneTextures.Velocity, ERenderTargetLoadAction::EClear);
+ 		}
+@@ -974,7 +976,7 @@ void FMobileSceneRenderer::RenderFullDepthPrepass(FRDGBuilder& GraphBuilder, TAr
+ 			PassParameters->RenderTargets.DepthStencil.SetDepthLoadAction(ERenderTargetLoadAction::ELoad);
+ 			PassParameters->RenderTargets.DepthStencil.SetStencilLoadAction(ERenderTargetLoadAction::ELoad);
+ 			PassParameters->RenderTargets.DepthStencil.SetDepthStencilAccess(FExclusiveDepthStencil::DepthWrite_StencilWrite);
+-			if (bShouldRenderVelocities)
++			if (bBindVelocity)
+ 			{
+ 				PassParameters->RenderTargets[0].SetLoadAction(ERenderTargetLoadAction::ELoad);
+ 			}
+@@ -1715,6 +1717,7 @@ void FMobileSceneRenderer::Render(FRDGBuilder& GraphBuilder, const FSceneRenderU
+ 		}
+ 	}
+ 
++	bool bMSAAVelocitiesRendered = false;
+ 	if (bIsFullDepthPrepassEnabled && !bShadowOnlyTimeslice)
+ 	{
+ 		RenderFullDepthPrepass(GraphBuilder, Views, SceneTextures, InstanceCullingManager);
+@@ -1724,6 +1727,12 @@ void FMobileSceneRenderer::Render(FRDGBuilder& GraphBuilder, const FSceneRenderU
+ 			AddResolveSceneDepthPass(GraphBuilder, Views, SceneTextures.Depth);
+ 		}
+ 
++		if (bShouldRenderVelocities && SceneTextures.Depth.Target->Desc.NumSamples > 1)
++		{
++			RenderMSAAVelocities(GraphBuilder, SceneTextures);
++			bMSAAVelocitiesRendered = true;
++		}
++
+ 		SceneTextures.MobileSetupMode = EMobileSceneTextureSetupMode::SceneDepth | EMobileSceneTextureSetupMode::SceneVelocity;
+ 		SceneTextures.MobileUniformBuffer = CreateMobileSceneTextureUniformBuffer(GraphBuilder, &SceneTextures, SceneTextures.MobileSetupMode);
+ 	}
+@@ -1860,7 +1869,8 @@ void FMobileSceneRenderer::Render(FRDGBuilder& GraphBuilder, const FSceneRenderU
+ 		SceneTextures.MobileSetupMode = EMobileSceneTextureSetupMode::All;
+ 		SceneTextures.MobileUniformBuffer = CreateMobileSceneTextureUniformBuffer(GraphBuilder, &SceneTextures, SceneTextures.MobileSetupMode);
+ 
+-		if (bShouldRenderVelocities)
++		// Under MSAA velocities exist for SSR only, which the opaque base pass has already used
++		if (bShouldRenderVelocities && !bMSAAVelocitiesRendered)
+ 		{
+ 			// Render the velocities of movable objects
+ 			EDepthDrawingMode EarlyZPassMode = Scene ? Scene->EarlyZPassMode : DDM_None;
+@@ -2196,6 +2206,11 @@ void FMobileSceneRenderer::RenderForward(FRDGBuilder& GraphBuilder, FRDGTextureR
+ 		}
+ 
+ 		EMobileSceneTextureSetupMode SetupMode = (bIsFullDepthPrepassEnabled ? EMobileSceneTextureSetupMode::SceneDepth : EMobileSceneTextureSetupMode::None) | EMobileSceneTextureSetupMode::CustomDepth;
++		// Screen space reflections reproject moving hits by the velocities rendered after the prepass
++		if (bIsFullDepthPrepassEnabled && bShouldRenderVelocities)
++		{
++			SetupMode |= EMobileSceneTextureSetupMode::SceneVelocity;
++		}
+ 		FMobileRenderPassParameters* PassParameters = GraphBuilder.AllocParameters<FMobileRenderPassParameters>();
+ 		PassParameters->View = View.GetShaderParameters();
+ 		PassParameters->MobileBasePass = CreateMobileBasePassUniformBuffer(GraphBuilder, View, EMobileBasePass::Opaque, SetupMode, BasePassTextures);
+diff --git a/Engine/Source/Runtime/Renderer/Private/SceneRendering.h b/Engine/Source/Runtime/Renderer/Private/SceneRendering.h
+index 8821a96b9d43..f1032e2377e2 100644
+--- a/Engine/Source/Runtime/Renderer/Private/SceneRendering.h
++++ b/Engine/Source/Runtime/Renderer/Private/SceneRendering.h
+@@ -3015,6 +3015,10 @@ protected:
+ 	void RenderMaskedPrePass(FRHICommandList& RHICmdList, const FViewInfo& View, const FInstanceCullingDrawParams* DepthPassInstanceCullingDrawParams);
+ 	void RenderFullDepthPrepass(FRDGBuilder& GraphBuilder, TArrayView<FViewInfo> InViews, FSceneTextures& SceneTextures, FInstanceCullingManager& InstanceCullingManager, bool bIsSceneCaptureRenderPass=false);
+ 
++	/** Renders opaque velocities against MSAA scene depth into a target of the same sample count, then resolves them into SceneTextures.Velocity. */
++	void RenderMSAAVelocities(FRDGBuilder& GraphBuilder, FSceneTextures& SceneTextures);
++
++
+ 	void RenderVelocityPass(FRHICommandList& RHICmdList, const FViewInfo& View, const FInstanceCullingDrawParams* InstanceCullingDrawParams);
+ 
+ 	void RenderCustomRenderPassBasePass(FRDGBuilder& GraphBuilder, TArrayView<FViewInfo> InViews, FRDGTextureRef ViewFamilyTexture, FSceneTextures& SceneTextures, FMobileBasePassTextures& BasePassTextures, FInstanceCullingManager& InstanceCullingManager, bool bIncludeTranslucent);
+diff --git a/Engine/Source/Runtime/Renderer/Private/VelocityRendering.cpp b/Engine/Source/Runtime/Renderer/Private/VelocityRendering.cpp
+index 3eb95f47ed92..0ccbd58d8816 100644
+--- a/Engine/Source/Runtime/Renderer/Private/VelocityRendering.cpp
++++ b/Engine/Source/Runtime/Renderer/Private/VelocityRendering.cpp
+@@ -25,6 +25,7 @@
+ #include "DebugProbeRendering.h"
+ #include "LogRenderer.h"
+ #include "RenderCore.h"
++#include "MobileSSR.h"
+ 
+ // Changing this causes a full shader recompile
+ static TAutoConsoleVariable<int32> CVarVelocityOutputPass(
+@@ -405,8 +406,9 @@ bool FMobileSceneRenderer::ShouldRenderVelocities() const
+ 		const bool bTemporalAA = IsTemporalAccumulationBasedMethod(View.AntiAliasingMethod);
+ 		const bool bIsUsingTemporalUpscaler = View.Family->GetTemporalUpscalerInterface() != nullptr;
+ 		const bool bVelocityRendering = (bIsUsingTemporalUpscaler || bTemporalAA) && !View.bCameraCut;
++		const bool bSSRVelocity = MobileSSRUsesVelocity(ShaderPlatform) && IsMobileSSREnabled(View) && !View.bCameraCut;
+ 
+-		bNeedsVelocity |= bVelocityRendering;
++		bNeedsVelocity |= bVelocityRendering || bSSRVelocity;
+ 	}
+ 
+ 	return bNeedsVelocity;
+@@ -854,9 +856,10 @@ bool FVelocityMeshProcessor::PrimitiveHasVelocityForView(const FViewInfo& View,
+ 	{
+ 		return false;
+ 	}
+-	// Only enabled on mobile when TAA is enabled or we're rendering OpenXR motion vectors.
++	// Only enabled on mobile when TAA is enabled, we're rendering OpenXR motion vectors, or screen space reflections reproject by velocity.
+ 	const bool bUsesTAA = (View.AntiAliasingMethod == AAM_TemporalAA);
+-	if (IsMobilePlatform(View.GetShaderPlatform()) && !(bUsesTAA || View.Family->EngineShowFlags.StereoMotionVectors))
++	const bool bSSRVelocity = MobileSSRUsesVelocity(View.GetShaderPlatform()) && IsMobileSSREnabled(View);
++	if (IsMobilePlatform(View.GetShaderPlatform()) && !(bUsesTAA || bSSRVelocity || View.Family->EngineShowFlags.StereoMotionVectors))
+ 	{
+ 		return false;
+ 	}
