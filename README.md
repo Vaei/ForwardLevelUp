@@ -20,6 +20,7 @@ Clean MSAA and proper ambient occlusion for Unreal Engine 5.8's mobile forward r
 - Soft particles without halos around foreground edges.
 - Screen-space reflections under MSAA without crashing, and reflections of moving objects that stay attached to them.
 - Virtual shadow maps without Nanite or TAA: sharp, detailed sun and local-light shadows at every distance, filtered without temporal noise.
+- Contact shadows from the sun under grass, fences, props and wheels, without TAA.
 - Diffuse GI from a grid of probes around the camera: interiors and covered streets stop glowing with sky light, and sun, sky, neon and local lights bounce.
 - Optionally, world normals for post-process materials.
 
@@ -51,6 +52,7 @@ You need a UE 5.8 source build, and a project using the mobile renderer (`bPrefe
    git apply <this repo>/Patches/18-probe-gi-relocation.patch
    git apply <this repo>/Patches/19-probe-gi-surface-colors.patch
    git apply <this repo>/Patches/20-vsm-pcss.patch
+   git apply <this repo>/Patches/21-mobile-screen-space-shadows.patch
    ```
 
 2. Build the editor. The first launch recompiles every material.
@@ -87,6 +89,7 @@ Each needs the setup above.
 - **Reflections that follow moving objects:** `r.Mobile.ScreenSpaceReflections.Velocity=1`, with screen-space reflections on. Renders velocities without TAA, MSAA included, so a reflected car stays under the car. Not on OpenGL.
 - **Virtual shadow maps:** `r.Mobile.VirtualShadowMaps=1`, `r.Shadow.Virtual.Enable=1` and `r.Mobile.SupportGPUScene=1`. Replaces cascaded and local-light shadow maps for movable lights; no Nanite needed. Rect lights cast shadows too. On Windows it needs DirectX 12 (`DefaultGraphicsRHI_DX12`, or `-d3d12`); DirectX 11 is not supported. On OpenGL and Vulkan it stays off and lights keep shadow maps.
 - **Contact-hardening soft shadows:** `r.Mobile.VirtualShadowMaps.Filter=1`, with virtual shadow maps on. Shadows are hard where an object touches the ground and soften with distance from it. The width follows each light's **Source Angle** (directional), **Source Radius** (point and spot) or **Source Width** and **Source Height** (rect); a light with zero keeps the fixed filter.
+- **Contact shadows from the sun:** `r.Mobile.ScreenSpaceShadows=1`. Adds screen-space shadow under grass, fences, props and anything else the sun grazes. It forces the mobile shadow mask and a full depth prepass. Set the sun's **Contact Shadow Length**, or leave it at zero to use `r.Mobile.ScreenSpaceShadows.Length` (0.02). Direct3D 12, Vulkan and Metal; not OpenGL. On Direct3D 12, `r.ContactShadows.Standalone.Method=1` uses Bend's full-res filter instead of the stock half-res one.
 - **Probe GI:** `r.Mobile.ProbeGI=1`, with `r.GenerateMeshDistanceFields=True`. Probes around the camera trace the global distance field and replace the sky light's diffuse inside their grid. Ray hits on screen take last frame's lit colour, which needs `r.Mobile.ScreenSpaceReflections=1`; hits off screen use the sun, sky and up to 64 nearby point, spot and rect lights, in the colour of the mesh they hit when `r.Mobile.SupportGPUScene=1`.
 
 ## Troubleshoot
@@ -108,13 +111,14 @@ Each needs the setup above.
 - **A decal looks frozen.** Decals are baked when they change. For materials animated by time set `r.Mobile.ClusteredDecals.RebakeEveryFrame=1`.
 - **Desktop Vulkan at ES3.1 with MSAA crashes in `vkCmdBeginRenderingKHR` (seen on NVIDIA).** Stock 5.8, with every patch setting at its default too. Set `r.Vulkan.AllowDynamicRendering=0` (read only, in the ini or with `-dpcvars`). The stock tonemap subpass on desktop Vulkan also asserts on a missing `FMobileMultiViewVertexShaderVS`; patch 9 only matters on devices with an on-chip MSAA resolve (Adreno).
 - **Unlit or translucent materials do not get the edge fixes or AO.** Only opaque and masked lit materials do.
-- **Velocity, virtual shadow map and probe GI settings ignored.** `r.Mobile.ScreenSpaceReflections.Velocity`, `r.Mobile.VirtualShadowMaps`, `r.Mobile.VirtualShadowMaps.FilterTaps` and `r.Mobile.ProbeGI` are read only: set them in the ini and restart. They recompile materials.
+- **Velocity, virtual shadow map and probe GI settings ignored.** `r.Mobile.ScreenSpaceReflections.Velocity`, `r.Mobile.ScreenSpaceShadows`, `r.Mobile.VirtualShadowMaps`, `r.Mobile.VirtualShadowMaps.FilterTaps` and `r.Mobile.ProbeGI` are read only: set them in the ini and restart. They recompile materials.
 - **Fatal error "r.Mobile.VirtualShadowMaps compiles shadow shaders with DXC, which DirectX 11 cannot run".** Switch the project to DirectX 12, or turn `r.Mobile.VirtualShadowMaps` off.
 - **Warning "r.Mobile.VirtualShadowMaps is off on SF_VULKAN_ES31".** Vulkan reads GPU Scene through uniform buffers, which virtual shadow maps do not support, so shadows use shadow maps. Use DirectX 12 on Windows; on Android, virtual shadow maps are unavailable.
 - **No virtual shadows.** `ProfileGPU` shows `VirtualShadowMapMarkPages` when they run. Check `r.Shadow.Virtual.Enable=1`, `r.Mobile.SupportGPUScene=1`, and that the light is Movable.
 - **Surfaces shadow themselves in stripes.** Raise `r.Mobile.VirtualShadowMaps.NormalBias`.
 - **Soft shadows look dithered.** The PCSS taps rotate per pixel, without temporal filtering. Lower `r.Mobile.VirtualShadowMaps.PCSS.MaxPenumbra`, or the light's source size.
 - **Soft shadows stay hard far from the object.** Raise `r.Mobile.VirtualShadowMaps.PCSS.SearchDistance` past the tallest occluder, and `r.Mobile.VirtualShadowMaps.PCSS.MaxPenumbra`.
+- **No contact shadows from the sun.** Check `r.Mobile.ScreenSpaceShadows=1` in the ini and restart, `ProfileGPU` shows `ScreenSpaceShadowing` under `RenderMobileScreenSpaceShadows`, and the sun's **Contact Shadow Length** or `r.Mobile.ScreenSpaceShadows.Length` is above zero. Every depth hit casts, so the per-primitive **Cast Contact Shadow** flag is ignored. Not on OpenGL.
 - **First launch with virtual shadow maps takes minutes.** Their shaders compile once for the mobile shader platform, then come from the DDC. From an empty DDC on a 32-thread PC, a small level took about 9 minutes against 2.5 without them.
 - **Probe GI does nothing.** `ProfileGPU` shows `MobileProbeGI` when it runs. It needs mesh distance fields; `r.Mobile.ProbeGI.Intensity` above 0.
 - **Interiors went dark with probe GI.** Expected: the sky light no longer leaks through walls and roofs. Light reaches the probes through openings and from lights inside.
@@ -149,6 +153,7 @@ Each needs the setup above.
 | `r.Mobile.VirtualShadowMaps.Filter` | 0 | 0 fixed-width filter, 1 contact-hardening soft shadows (PCSS): 8 lookups, plus 16 near a shadow. |
 | `r.Mobile.VirtualShadowMaps.PCSS.SearchDistance` | 2000 | Farthest sun occluder, in world units, that gets its full penumbra. |
 | `r.Mobile.VirtualShadowMaps.PCSS.MaxPenumbra` | 32 | Widest soft shadow edge, in screen pixels. |
+| `r.Mobile.ScreenSpaceShadows.Length` | 0.02 | Ray length as a fraction of view depth, used when the sun's Contact Shadow Length is 0. |
 | `r.Mobile.ProbeGI.Spacing` | 200 | World distance between probes. About 0.24 ms for the whole update at the defaults. |
 | `r.Mobile.ProbeGI.GridSizeXY` / `.GridSizeZ` | 32 / 16 | Probes across and up. The grid covers this times the spacing, centred on the camera. |
 | `r.Mobile.ProbeGI.RaysPerProbe` | 64 | Rays per probe update, 32 to 256. More is smoother and costs more. |

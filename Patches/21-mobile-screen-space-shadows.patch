@@ -1,0 +1,242 @@
+diff --git a/Engine/Shaders/Private/ScreenSpaceShadows.usf b/Engine/Shaders/Private/ScreenSpaceShadows.usf
+index 8271846..5e24754 100644
+--- a/Engine/Shaders/Private/ScreenSpaceShadows.usf
++++ b/Engine/Shaders/Private/ScreenSpaceShadows.usf
+@@ -137,7 +137,12 @@ void ScreenSpaceShadowsCS(
+ 	const float ContactShadowLengthScreenScale = GetScreenRayLengthMultiplierForProjectionType(SceneDepth).y;
+ 	const float ActualContactShadowLength = ContactShadowLength * (bContactShadowLengthInWS ? 1.0f : ContactShadowLengthScreenScale);
+ 
++#if MOBILE_SCREEN_SPACE_SHADOWS
++	// A fixed pattern stays put without TAA.
++	const float Dither = InterleavedGradientNoise(DispatchThreadId.xy + 0.5f, 0);
++#else
+ 	const float Dither = InterleavedGradientNoise(DispatchThreadId.xy + 0.5f, View.StateFrameIndexMod8);
++#endif
+ 
+ 	float2 HitUV;
+ 	float HitDistance = CastScreenSpaceShadowRay(OpaqueTranslatedWorldPosition, LightDirection, ActualContactShadowLength, 8, Dither, 2.0f, false, HitUV);
+diff --git a/Engine/Source/Runtime/RenderCore/Private/RenderUtils.cpp b/Engine/Source/Runtime/RenderCore/Private/RenderUtils.cpp
+index 1bdf649..f2adc40 100644
+--- a/Engine/Source/Runtime/RenderCore/Private/RenderUtils.cpp
++++ b/Engine/Source/Runtime/RenderCore/Private/RenderUtils.cpp
+@@ -583,6 +583,12 @@ RENDERCORE_API bool IsMobileAmbientOcclusionEnabled(const FStaticShaderPlatform
+ 	return IsMobilePlatform(Platform) && MobileAmbientOcclusionIniValue.Get(Platform);
+ }
+ 
++RENDERCORE_API bool IsMobileScreenSpaceShadowsEnabled(const FStaticShaderPlatform Platform)
++{
++	static FShaderPlatformCachedIniValue<bool> MobileScreenSpaceShadowsIniValue(TEXT("r.Mobile.ScreenSpaceShadows"));
++	return IsMobilePlatform(Platform) && !IsOpenGLPlatform(Platform) && MobileScreenSpaceShadowsIniValue.Get(Platform);
++}
++
+ // Only for a mobile ForwardShading
+ RENDERCORE_API bool AreMobileScreenSpaceReflectionsEnabled(const FStaticShaderPlatform Platform)
+ {
+@@ -625,8 +631,10 @@ RENDERCORE_API bool MobileUsesShadowMaskTexture(const FStaticShaderPlatform Plat
+ 	const bool bMobileCapsuleShadowsEnabled = IsMobileCapsuleDirectShadowsEnabled(Platform);
+ 	const bool bMobileDistanceFieldEnabled = IsMobileDistanceFieldEnabled(Platform);
+ 	const bool bForcedDepthPrepass = FReadOnlyCVARCache::MobileEarlyZPass(Platform) == 1; 
++	const bool bMobileScreenSpaceShadows = IsMobileScreenSpaceShadowsEnabled(Platform) && !IsMobileDeferredShadingEnabled(Platform);
+ 	// In case any of these feature are used force shadowmask path
+-	return (bForcedDepthPrepass || bMobileDistanceFieldEnabled || bMobileCapsuleShadowsEnabled || bMoveablePointOrSpotLightShadowsEnabledForward);
++	return (bForcedDepthPrepass || bMobileDistanceFieldEnabled || bMobileCapsuleShadowsEnabled
++		|| bMoveablePointOrSpotLightShadowsEnabledForward || bMobileScreenSpaceShadows);
+ }
+ 
+ // Whether to support more than 4 color attachments for GBuffer 
+diff --git a/Engine/Source/Runtime/RenderCore/Public/RenderUtils.h b/Engine/Source/Runtime/RenderCore/Public/RenderUtils.h
+index 19b8584..05e9d5b 100644
+--- a/Engine/Source/Runtime/RenderCore/Public/RenderUtils.h
++++ b/Engine/Source/Runtime/RenderCore/Public/RenderUtils.h
+@@ -306,6 +306,9 @@ RENDERCORE_API uint32 GetPlatformShadingModelsMask(const FStaticShaderPlatform P
+ /** Returns whether AO is enabled. Only valid for a mobile forward shading. */
+ RENDERCORE_API bool IsMobileAmbientOcclusionEnabled(const FStaticShaderPlatform Platform);
+ 
++/** Returns whether the mobile screen-space shadows setting is enabled. */
++RENDERCORE_API bool IsMobileScreenSpaceShadowsEnabled(const FStaticShaderPlatform Platform);
++
+ RENDERCORE_API bool AreMobileScreenSpaceReflectionsEnabled(const FStaticShaderPlatform Platform);
+ 
+ RENDERCORE_API bool IsMobileDistanceFieldEnabled(const FStaticShaderPlatform Platform);
+diff --git a/Engine/Source/Runtime/Renderer/Private/ShadowRendering.cpp b/Engine/Source/Runtime/Renderer/Private/ShadowRendering.cpp
+index f8b437e..bdb38a1 100644
+--- a/Engine/Source/Runtime/Renderer/Private/ShadowRendering.cpp
++++ b/Engine/Source/Runtime/Renderer/Private/ShadowRendering.cpp
+@@ -18,6 +18,7 @@
+ #include "Shadows/ScreenSpaceShadows.h"
+ #include "Shadows/FirstPersonSelfShadow.h"
+ #include "RenderCore.h"
++#include "RenderUtils.h"
+ #include "TranslucentLighting.h"
+ #include "MobileBasePassRendering.h"
+ #include "RHIResourceUtils.h"
+@@ -2590,9 +2591,10 @@ void FMobileSceneRenderer::ClearMobileScreenSpaceShadows(FRDGBuilder& GraphBuild
+ void FMobileSceneRenderer::RenderMobileScreenSpaceShadows(FRDGBuilder& GraphBuilder, FIntPoint Extent, FRDGTextureRef ScreenShadowMaskTexture)
+ {
+ 	static auto* ContactShadowsCVar = IConsoleManager::Get().FindTConsoleVariableDataInt(TEXT("r.ContactShadows"));
++	const bool bMobileScreenSpaceShadows = IsMobileScreenSpaceShadowsEnabled(ShaderPlatform) && !IsMobileDeferredShadingEnabled(ShaderPlatform);
+ 	if (ScreenShadowMaskTexture == nullptr
+ 		|| IsOpenGLPlatform(ShaderPlatform) // FIXME: GL does not support writing to rg32f images
+-		|| (ContactShadowsCVar && ContactShadowsCVar->GetValueOnRenderThread() == 0))
++		|| (!bMobileScreenSpaceShadows && ContactShadowsCVar && ContactShadowsCVar->GetValueOnRenderThread() == 0))
+ 	{
+ 		return;
+ 	}
+@@ -2614,7 +2616,7 @@ void FMobileSceneRenderer::RenderMobileScreenSpaceShadows(FRDGBuilder& GraphBuil
+ 		{
+ 			// Dynamic shadows are projected into channels of the light attenuation texture based on their assigned DynamicShadowMapChannel
+ 			// Only render screen space shadows if light is assigned to a valid DynamicShadowMapChannel
+-			RenderScreenSpaceShadows(GraphBuilder, SceneTextures, Views, LightSceneInfo, bProjectingForForwardShading, ScreenShadowMaskTexture);
++			RenderScreenSpaceShadows(GraphBuilder, SceneTextures, Views, LightSceneInfo, bProjectingForForwardShading, ScreenShadowMaskTexture, bMobileScreenSpaceShadows);
+ 		}
+ 	}
+ }
+diff --git a/Engine/Source/Runtime/Renderer/Private/Shadows/ScreenSpaceShadows.cpp b/Engine/Source/Runtime/Renderer/Private/Shadows/ScreenSpaceShadows.cpp
+index 38a34ea..96a4777 100644
+--- a/Engine/Source/Runtime/Renderer/Private/Shadows/ScreenSpaceShadows.cpp
++++ b/Engine/Source/Runtime/Renderer/Private/Shadows/ScreenSpaceShadows.cpp
+@@ -14,6 +14,7 @@
+ #include "SceneRendering.h"
+ #include "RenderGraphUtils.h"
+ #include "PixelShaderUtils.h"
++#include "RenderUtils.h"
+ 
+ #include "bend_sss_cpu.h"
+ 
+@@ -81,6 +82,25 @@ static FAutoConsoleVariableRef CVarContactShadowsIntensityFadeLength(
+ 
+ extern void GetLightContactShadowParameters(const FLightSceneProxy* Proxy, float& OutLength, bool& bOutLengthInWS, float& OutCastingIntensity, float& OutNonCastingIntensity);
+ 
++static int32 GMobileScreenSpaceShadows = 0;
++static FAutoConsoleVariableRef CVarMobileScreenSpaceShadows(
++	TEXT("r.Mobile.ScreenSpaceShadows"),
++	GMobileScreenSpaceShadows,
++	TEXT("Renders screen-space contact shadows in the mobile forward path. Read only; set it in the ini and restart.\n")
++	TEXT("0: off\n")
++	TEXT("1: on. Forces the mobile shadow mask path and a full depth prepass. Not supported on OpenGL."),
++	ECVF_ReadOnly
++);
++
++static float GMobileScreenSpaceShadowsLength = 0.02f;
++static FAutoConsoleVariableRef CVarMobileScreenSpaceShadowsLength(
++	TEXT("r.Mobile.ScreenSpaceShadows.Length"),
++	GMobileScreenSpaceShadowsLength,
++	TEXT("Screen-space contact shadow ray length as a fraction of view depth, used when the sun's Contact Shadow Length is zero.\n")
++	TEXT("A directional light with a non-zero Contact Shadow Length uses that value instead."),
++	ECVF_RenderThreadSafe
++);
++
+ const int32 GScreenSpaceShadowsTileSizeX = 8;
+ const int32 GScreenSpaceShadowsTileSizeY = 8;
+ 
+@@ -123,6 +143,7 @@ class FScreenSpaceShadowsCS : public FGlobalShader
+ 		OutEnvironment.SetDefine(TEXT("THREADGROUP_SIZEX"), GScreenSpaceShadowsTileSizeX);
+ 		OutEnvironment.SetDefine(TEXT("THREADGROUP_SIZEY"), GScreenSpaceShadowsTileSizeY);
+ 		OutEnvironment.SetDefine(TEXT("FORCE_DEPTH_TEXTURE_READS"), 1);
++		OutEnvironment.SetDefine(TEXT("MOBILE_SCREEN_SPACE_SHADOWS"), IsMobileScreenSpaceShadowsEnabled(Parameters.Platform) ? 1 : 0);
+ 		OutEnvironment.SetDefine(TEXT("PLATFORM_SUPPORTS_TYPED_UAV_LOAD"), (int32)RHISupports4ComponentUAVReadWrite(Parameters.Platform));
+ 	}
+ };
+@@ -290,7 +311,8 @@ void RenderScreenSpaceShadows(
+ 	FIntRect ScissorRect,
+ 	bool bProjectingForForwardShading,
+ 	const FLightSceneInfo* LightSceneInfo,
+-	FRDGTextureRef ScreenShadowMaskTexture)
++	FRDGTextureRef ScreenShadowMaskTexture,
++	bool bMobileScreenSpaceShadows)
+ {
+ 	check(ScissorRect.Area() > 0);
+ 
+@@ -324,6 +346,17 @@ void RenderScreenSpaceShadows(
+ 		float ContactShadowNonCastingIntensity;
+ 		GetLightContactShadowParameters(LightProxy, ContactShadowLength, bContactShadowLengthInWS, ContactShadowCastingIntensity, ContactShadowNonCastingIntensity);
+ 
++		if (bMobileScreenSpaceShadows)
++		{
++			if (ContactShadowLength <= 0.0f)
++			{
++				ContactShadowLength = FMath::Max(0.0f, GMobileScreenSpaceShadowsLength);
++				bContactShadowLengthInWS = false;
++			}
++			// The mobile forward prepass has no contact shadow stencil bit, so every depth hit casts
++			ContactShadowNonCastingIntensity = ContactShadowCastingIntensity;
++		}
++
+ 		PassParameters->ContactShadowLength = ContactShadowLength;
+ 		PassParameters->bContactShadowLengthInWS = bContactShadowLengthInWS;
+ 		PassParameters->ContactShadowCastingIntensity = ContactShadowCastingIntensity;
+@@ -363,7 +396,8 @@ void RenderScreenSpaceShadowsBend(
+ 	FIntRect ScissorRect,
+ 	bool bProjectingForForwardShading,
+ 	const FLightSceneInfo* LightSceneInfo,
+-	FRDGTextureRef ScreenShadowMaskTexture)
++	FRDGTextureRef ScreenShadowMaskTexture,
++	bool bMobileScreenSpaceShadows)
+ {
+ 	check(ScissorRect.Area() > 0);
+ 
+@@ -420,6 +454,16 @@ void RenderScreenSpaceShadowsBend(
+ 			float ContactShadowNonCastingIntensity;
+ 			GetLightContactShadowParameters(LightProxy, ContactShadowLength, bContactShadowLengthInWS, ContactShadowCastingIntensity, ContactShadowNonCastingIntensity);
+ 
++			if (bMobileScreenSpaceShadows)
++			{
++				if (ContactShadowLength <= 0.0f)
++				{
++					ContactShadowLength = FMath::Max(0.0f, GMobileScreenSpaceShadowsLength);
++					bContactShadowLengthInWS = false;
++				}
++				ContactShadowNonCastingIntensity = ContactShadowCastingIntensity;
++			}
++
+ 			PassParameters->ContactShadowLength = ContactShadowLength;
+ 			PassParameters->bContactShadowLengthInWS = bContactShadowLengthInWS;
+ 			PassParameters->ContactShadowCastingIntensity = ContactShadowCastingIntensity;
+@@ -464,11 +508,13 @@ void RenderScreenSpaceShadows(
+ 	const TArray<FViewInfo>& Views,
+ 	const FLightSceneInfo* LightSceneInfo,
+ 	bool bProjectingForForwardShading,
+-	FRDGTextureRef ScreenShadowMaskTexture)
++	FRDGTextureRef ScreenShadowMaskTexture,
++	bool bMobileScreenSpaceShadows)
+ {
+ 	static auto* ContactShadowsCVar = IConsoleManager::Get().FindTConsoleVariableDataInt(TEXT("r.ContactShadows"));
+ 
+-	if (ScreenShadowMaskTexture == nullptr || (ContactShadowsCVar && ContactShadowsCVar->GetValueOnRenderThread() == 0))
++	if (ScreenShadowMaskTexture == nullptr
++		|| ((ContactShadowsCVar && ContactShadowsCVar->GetValueOnRenderThread() == 0) && !bMobileScreenSpaceShadows))
+ 	{
+ 		return;
+ 	}
+@@ -506,7 +552,8 @@ void RenderScreenSpaceShadows(
+ 					ScissorRect,
+ 					bProjectingForForwardShading,
+ 					LightSceneInfo,
+-					ScreenShadowMaskTexture);
++					ScreenShadowMaskTexture,
++					bMobileScreenSpaceShadows);
+ 			}
+ 			else
+ 			{
+@@ -518,7 +565,8 @@ void RenderScreenSpaceShadows(
+ 					ScissorRect,
+ 					bProjectingForForwardShading,
+ 					LightSceneInfo,
+-					ScreenShadowMaskTexture);
++					ScreenShadowMaskTexture,
++					bMobileScreenSpaceShadows);
+ 			}
+ 		}
+ 	}
+diff --git a/Engine/Source/Runtime/Renderer/Private/Shadows/ScreenSpaceShadows.h b/Engine/Source/Runtime/Renderer/Private/Shadows/ScreenSpaceShadows.h
+index c611299..838982c 100644
+--- a/Engine/Source/Runtime/Renderer/Private/Shadows/ScreenSpaceShadows.h
++++ b/Engine/Source/Runtime/Renderer/Private/Shadows/ScreenSpaceShadows.h
+@@ -21,4 +21,5 @@ void RenderScreenSpaceShadows(
+ 	const TArray<FViewInfo>& Views,
+ 	const FLightSceneInfo* LightSceneInfo,
+ 	bool bProjectingForForwardShading,
+-	FRDGTextureRef ScreenShadowMaskTexture);
++	FRDGTextureRef ScreenShadowMaskTexture,
++	bool bMobileScreenSpaceShadows = false);
+\ No newline at end of file

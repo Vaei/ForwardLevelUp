@@ -81,6 +81,7 @@ footer { color: var(--muted); font-size: 14px; }
       <div class="card"><h3>Clean soft particles</h3><p>Depth-faded particles stop leaving a halo around foreground edges.</p></div>
       <div class="card"><h3>Reflections that keep up</h3><p>A moving object's reflection stays under it, with MSAA on and no TAA.</p></div>
       <div class="card"><h3>Virtual shadow maps</h3><p>Sharp sun, spot, point and rect light shadows at every distance, without Nanite or TAA. Optionally hard at contact and softer with distance.</p></div>
+      <div class="card"><h3>Sun contact shadows</h3><p>Grass, fences, props and wheels darken where they meet the ground, from the sun, without TAA.</p></div>
       <div class="card"><h3>Probe GI</h3><p>Interiors and covered streets stop glowing with sky light. Sun, sky, neon and local lights bounce, in the colour of the surface they hit.</p></div>
     </div>
   </section>
@@ -130,7 +131,7 @@ footer { color: var(--muted); font-size: 14px; }
     <h2>Set it up</h2>
     <p>You need a UE 5.8 source build, and a project on the mobile renderer: <code>bPreferFeatureLevelES31</code> on PC, or a mobile platform.</p>
     <ol>
-      <li>Download the repository and apply the twenty patches in <code>Patches/</code> to the engine, in order, with <code>git apply</code>.</li>
+      <li>Download the repository and apply the twenty one patches in <code>Patches/</code> to the engine, in order, with <code>git apply</code>.</li>
       <li>Build the editor. The first launch recompiles every material.</li>
       <li>Add the settings below to <code>Config/DefaultEngine.ini</code> under <code>[/Script/Engine.RendererSettings]</code>, then restart the editor.</li>
     </ol>
@@ -142,7 +143,7 @@ r.Mobile.MSAA.EdgeAwareFetch=1
 r.Mobile.MSAA.SkipRedundantResolve=1
 r.Mobile.AmbientOcclusion=1
 r.DefaultFeature.AmbientOcclusion=True</code></pre>
-    <p>The <a href="https://github.com/Vaei/ForwardLevelUp#readme">README</a> covers the optional extras (distance-field AO, contact shadows, reflections, occlusion and bounce light from buildings, decals, soft particles, world normals, virtual shadow maps, probe GI), what to check when something doesn't show up, and every setting.</p>
+    <p>The <a href="https://github.com/Vaei/ForwardLevelUp#readme">README</a> covers the optional extras (distance-field AO, contact shadows, sun contact shadows, reflections, occlusion and bounce light from buildings, decals, soft particles, world normals, virtual shadow maps, probe GI), what to check when something doesn't show up, and every setting.</p>
   </section>
 
   <section>
@@ -196,6 +197,7 @@ r.DefaultFeature.AmbientOcclusion=True</code></pre>
           <tr><td>18 Probe relocation</td><td>Probes on the grid sit inside walls and floors, which shows as blotches.</td><td>Each probe moves out of nearby geometry, and bright ray hits are clamped (<code>r.Mobile.ProbeGI.Relocation</code>, <code>r.Mobile.ProbeGI.MaxRayLuminance</code>).</td></tr>
           <tr><td>19 Probe surface colours</td><td>Off-screen ray hits use one assumed albedo.</td><td>Each hit takes its mesh's base colour, found through the global distance field object grid (<code>r.Mobile.ProbeGI.SurfaceColors</code>).</td></tr>
           <tr><td>20 Soft virtual shadows</td><td>A fixed-width filter; mobile never shadows rect lights.</td><td>Optional contact-hardening filter (<code>r.Mobile.VirtualShadowMaps.Filter</code>), and rect light shadows.</td></tr>
+          <tr><td>21 Sun contact shadows</td><td>Mobile forward has a screen-space shadow pass, but the prepass never sets the cast bit and the mobile profiles disable contact shadows.</td><td>An opt-in sun pass with a stable pattern under MSAA and a default ray length (<code>r.Mobile.ScreenSpaceShadows</code>).</td></tr>
         </tbody>
       </table></div>
     </details>
